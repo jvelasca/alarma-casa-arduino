@@ -76,8 +76,8 @@ def test_el_ready_real_se_decodifica() -> None:
 # -- El emisor del sketch ---------------------------------------------------
 
 
-def _emit_body(name: str) -> str:
-    """Devuelve el cuerpo de `void emitAlgo(...)`, sin las llaves exteriores."""
+def _cuerpo(name: str) -> str:
+    """Devuelve el cuerpo de `void name(...)`, sin las llaves exteriores."""
     source = FIRMWARE.read_text(encoding="utf-8")
     match = re.search(rf"void {name}\([^)]*\) \{{(.*?)\n\}}", source, re.S)
     assert match, f"no se encuentra la funcion {name} en el sketch"
@@ -104,13 +104,13 @@ def _assembled_json(body: str) -> str:
 
 def test_el_hello_del_sketch_es_json_valido() -> None:
     """Regresion del `}],,` que hacia ilegible el saludo de la placa."""
-    text = _assembled_json(_emit_body("emitHello"))
+    text = _assembled_json(_cuerpo("emitHello"))
 
     assert ",," not in text, f"coma doble en el hello del sketch: {text}"
     data = json.loads(text)
     assert data["t"] == "hello"
     assert data["proto"] == 1
-    assert data["cfg"].keys() >= {"warmup_ms", "buzzer_pin", "buzzer", "armed"}
+    assert data["cfg"].keys() >= {"warmup_ms", "buzzer_pin", "buzzer", "armed", "wdt_rst"}
     assert data["zones"] == [{"id": 1, "pin": 0, "name": "pir"}]
 
 
@@ -130,7 +130,7 @@ def test_el_pin_del_zumbador_del_sketch_coincide_con_la_configuracion() -> None:
 
 @pytest.mark.parametrize("name", ["emitHeartbeat", "emitEvent", "emitCalibEdge"])
 def test_los_demas_emisores_no_llevan_comas_dobles(name: str) -> None:
-    text = _assembled_json(_emit_body(name))
+    text = _assembled_json(_cuerpo(name))
 
     assert ",," not in text, f"coma doble en {name}: {text}"
 
@@ -200,3 +200,76 @@ def test_el_sketch_genera_las_cadencias_de_los_retardos() -> None:
     # pedir otra cosa y dejar el reloj viejo pitando seria contradecirlo.
     assert "g_cdActive = false" in names.group(1)
     assert 'strcmp(name, "exit") != 0' in names.group(1)
+
+
+# -- Lo que un auditor mira primero -----------------------------------------
+
+
+def _sin_comentarios(texto: str) -> str:
+    """Quita comentarios: el sketch habla de `delay()` justo para decir que no lo usa."""
+    sin_bloque = re.sub(r"/\*.*?\*/", "", texto, flags=re.S)
+    return re.sub(r"//[^\n]*", "", sin_bloque)
+
+
+def test_el_sketch_alimenta_el_watchdog() -> None:
+    """Un bucle colgado tiene que reiniciar la placa, no dejarla muda.
+
+    El documento de premisas prometia un watchdog de 8 s desde F1 y el sketch no
+    lo tenia: un bloqueo dejaba la placa sin latido hasta que alguien la
+    desenchufaba, que es justo lo que un sistema de alarma no puede permitirse.
+    """
+    source = FIRMWARE.read_text(encoding="utf-8")
+    setup = _cuerpo("setup")
+    loop = _cuerpo("loop")
+
+    assert "#include <avr/wdt.h>" in source
+    assert "wdt_enable(WDTO_8S)" in source, "el watchdog debe armarse a 8 s"
+
+    # La receta contra el bucle de reinicios: leer MCUSR, limpiarlo y desactivar
+    # el perro antes de nada, y solo armarlo al final del arranque.
+    assert "MCUSR = 0" in setup
+    assert "wdt_disable()" in setup
+    assert "g_wdtReset" in setup, "el motivo del reinicio tiene que guardarse"
+    assert setup.index("MCUSR = 0") < setup.index("wdt_enable"), "limpiar MCUSR va antes de armar"
+    assert setup.index("emitHello()") < setup.index("wdt_enable"), "armar despues del hello"
+
+    # Y alimentarlo en cada vuelta del bucle, como primera sentencia.
+    cuerpo = _sin_comentarios(loop).strip()
+    assert cuerpo.startswith("wdt_reset();"), cuerpo[:60]
+
+
+def test_el_sketch_no_bloquea_ni_reserva_memoria() -> None:
+    """Ni `delay()` ni memoria dinamica: un Mega encendido meses no lo perdona."""
+    codigo = _sin_comentarios(FIRMWARE.read_text(encoding="utf-8"))
+
+    prohibidos = {
+        r"\bdelay\s*\(": "delay() bloquea el bucle y deja de atender el enlace",
+        r"\bdelayMicroseconds\s*\(": "delayMicroseconds() bloquea el bucle",
+        r"\bString\b": "String fragmenta los 8 KB de RAM",
+        r"\bmalloc\s*\(": "malloc fragmenta los 8 KB de RAM",
+        r"\bnew\b": "new fragmenta los 8 KB de RAM",
+    }
+    for patron, motivo in prohibidos.items():
+        assert not re.search(patron, codigo), motivo
+
+
+def test_el_buffer_y_la_linea_coinciden_con_el_protocolo() -> None:
+    """Los numeros del sketch y los del documento tienen que ser los mismos.
+
+    El documento de premisas llego a decir 32 eventos y 256 bytes cuando el
+    sketch tenia 16 y 96. Aqui se leen del codigo y se comprueba que el
+    protocolo publica esos, para que no vuelvan a separarse.
+    """
+    source = FIRMWARE.read_text(encoding="utf-8")
+    evt = re.search(r"const uint8_t EVT_CAP = (\d+);", source)
+    cmd = re.search(r"const uint8_t CMD_CAP = (\d+);", source)
+    assert evt, "no se encuentra EVT_CAP en el sketch"
+    assert cmd, "no se encuentra CMD_CAP en el sketch"
+
+    protocolo = (FIRMWARE.parents[2] / "doc" / "02-PROTOCOLO.md").read_text(encoding="utf-8")
+    assert f"({evt.group(1)} posiciones)" in protocolo, (
+        f"el sketch guarda {evt.group(1)} eventos y el protocolo dice otra cosa"
+    )
+    assert f"a {cmd.group(1)} en el downlink" in protocolo, (
+        f"el sketch corta a {cmd.group(1)} bytes y el protocolo dice otra cosa"
+    )

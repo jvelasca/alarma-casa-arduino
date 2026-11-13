@@ -15,6 +15,40 @@ sigue [Keep a Changelog](https://keepachangelog.com/es/1.1.0/) y la numeración
 
 - Zonas, panel web y bandeja del sistema (F2-F3 de la hoja de ruta).
 
+## [0.1.2] — 2026-11-13
+
+Revisión previa a una auditoría externa: el firmware gana el watchdog que la
+documentación prometía desde F1, y la documentación deja de describir un
+firmware que no era el que está escrito.
+
+### Añadido
+
+- **Watchdog de 8 s en la placa.** `setup()` lee y limpia `MCUSR`, desactiva el
+  perro antes de nada (la receta que evita el bucle de reinicios del gestor de
+  arranque) y lo arma al final; `loop()` lo alimenta en su primera línea. Si el
+  bucle se cuelga, la placa se reinicia sola en vez de quedarse muda, y el PC ve
+  desaparecer el latido y volver el `hello`.
+- **`cfg.wdt_rst` en el `hello`.** Vale 1 cuando el arranque anterior lo provocó
+  el watchdog y 0 en cualquier otro caso, para distinguir «se cayó y se levantó
+  sola» de «alguien la desconectó». Documentado en `doc/02-PROTOCOLO.md`.
+- **Sección «Límites conocidos»** en `doc/00-PREMISAS.md` §4.5: sin SAI ni
+  batería, sin supervisión de línea, piezo en vez de sirena de potencia, sin
+  teclado físico, una sola zona y el watchdog del PC entendido como latido.
+- **Pruebas de contrato del sketch**: watchdog armado y alimentado, prohibición
+  de `delay()`, `String`, `malloc` y `new`, y comprobación de que `EVT_CAP` y
+  `CMD_CAP` coinciden con los números publicados en el protocolo.
+
+### Corregido
+
+- **`doc/00-PREMISAS.md` §4.4 describía otro firmware.** Decía 32 eventos
+  (son 16), 256 bytes de línea (son 96 en el downlink), configuración en EEPROM
+  (vive en RAM y el PC la reenvía en cada handshake, ADR-024), LED con parpadeo
+  por estado de enlace (parpadea al calentar y después copia el PIR) e
+  interrupción en `RISING` y `FALLING` (es `CHANGE`). Corregido en §4.2, §4.4 y
+  §9.3, y anotado el consumo real: 15 404 bytes de flash (6 %) y 1 018 de RAM
+  (12 %) con el watchdog dentro.
+- Versión del firmware a **1.6.0**.
+
 ## [0.1.1] — 2026-11-13
 
 Primera ejecución de la integración continua. No cambia nada de lo que hace la
@@ -73,6 +107,7 @@ Mega como sensor y la aplicación de escritorio como central.
 - **Pruebas y calidad** — 501 pruebas de `pytest`, `ruff` y `mypy` en modo
   estricto, comprobados en integración continua.
 
-[Sin publicar]: https://github.com/jvelasca/alarma-casa-arduino/compare/v0.1.1...HEAD
+[Sin publicar]: https://github.com/jvelasca/alarma-casa-arduino/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/jvelasca/alarma-casa-arduino/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/jvelasca/alarma-casa-arduino/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/jvelasca/alarma-casa-arduino/releases/tag/v0.1.0

@@ -64,6 +64,8 @@ Fijar las premisas que no deben cambiar a la ligera: alcance, cableado, protocol
 - Un corte de luz deja el sistema inoperativo salvo que se añada SAI (ver preguntas abiertas).
 - Es un sistema **disuasorio y de aviso**, no un sistema certificado de seguridad. No debe ser el único medio para proteger personas.
 
+Los límites concretos del firmware —sin SAI, sin supervisión de línea, piezo en vez de sirena, sin teclado— están listados en §4.5 para que no haya que deducirlos leyendo el sketch.
+
 ### 1.5 Principios de diseño
 
 1. **Modularidad por puertos y adaptadores.** Las capas altas nunca conocen si el dispositivo es real o simulado, ni si el aviso sale por Telegram o por Twilio.
@@ -223,7 +225,7 @@ Firmata es un protocolo genérico que convierte el Arduino en un **extensor de p
 | Lógica del sensor | En el PC: hay que sondear o escuchar flancos por red | En el Arduino: interrupción, antirrebote y filtrado local |
 | Latencia y jitter | Mayor: cada cambio viaja como mensaje de protocolo genérico | Baja y determinista |
 | Robustez ante caída del PC | Nula: el Arduino no hace nada útil sin PC | Puede guardar eventos en un buffer circular y activar avisos locales |
-| Reconexión | Al reconectar se pierde el estado y hay que reconfigurar pines | Handshake propio, configuración persistida en EEPROM |
+| Reconexión | Al reconectar se pierde el estado y hay que reconfigurar pines | Handshake propio; el PC reenvía su configuración en cada conexión |
 | Diagnóstico | No hay heartbeat ni números de secuencia | Heartbeat, `seq`, `ack` y códigos de error |
 | Ampliación (multizona, sirena, teclado) | Cada elemento nuevo es más tráfico y más lógica en Python | Un mensaje de evento por zona; escalado natural |
 | Dependencia | `pyFirmata` + firmware estándar ajeno | Código propio bajo nuestro control |
@@ -244,15 +246,29 @@ Motivos, por orden de peso:
 
 ### 4.4 Diseño del firmware
 
-- **Sin `delay()`.** Bucle `loop()` no bloqueante; temporización con `millis()`.
-- **Interrupción** en el pin 2 para `RISING` y `FALLING`; el manejador solo marca una bandera y sella `millis()`.
-- **Antirrebote** de 50 ms en el bucle principal.
-- **Estado de calentamiento** de 60 s tras el arranque: no se emiten eventos de intrusión, solo `warmup`.
-- **Buffer circular** de 32 eventos pendientes hasta recibir confirmación del PC; si se llena, descarta los más antiguos y lo reporta con un contador de descartes.
-- **Watchdog** de 8 s (`wdt_enable`) para recuperarse de un bloqueo.
-- **Configuración en EEPROM** (retardo mínimo entre eventos, pin de zona, LED de estado, flag de calentamiento) con *checksum* y valores por defecto si está corrupta.
-- **LED de estado** en el pin 13 del propio Arduino: parpadeo lento = esperando PC, fijo = enlazado, destello = evento emitido.
-- **Longitud máxima de línea** de 256 bytes; las líneas más largas se descartan y se reporta error.
+- **Sin `delay()`.** Bucle `loop()` no bloqueante; temporización con `millis()`. La única espera del sistema es la del calentamiento, y también es un contador, no una pausa.
+- **Interrupción** en el pin 2 con `CHANGE` (equivalente a `RISING` y `FALLING` juntos, y una sola llamada a `attachInterrupt`); el manejador solo cuenta flancos y sella `millis()`.
+- **Antirrebote** de 50 ms en el bucle principal: el nivel tiene que mantenerse distinto del estable ese tiempo antes de aceptarse, y el evento se sella con la hora del flanco, no con la de confirmación.
+- **Estado de calentamiento** de 60 s tras el arranque: no se emiten eventos de intrusión, solo latidos con `warmup:1`.
+- **Buffer circular** de **16 eventos** pendientes de acuse (`EVT_CAP` en el sketch); si se llena, descarta los más antiguos y lo reporta con el contador `lost` del latido. Caben tres segundos de rebotes sin perder nada, y como el PC acusa en cuanto lee, no hace falta más.
+- **Watchdog** de 8 s (`wdt_enable(WDTO_8S)`) para recuperarse de un bloqueo. `setup()` limpia `MCUSR` y desactiva el perro antes de nada (la receta que evita el bucle de reinicios del gestor de arranque) y lo arma al final; `loop()` lo alimenta en su primera línea. Si el arranque anterior fue del watchdog, el primer `hello` lo dice con `cfg.wdt_rst: 1`.
+- **Configuración en RAM**, no en EEPROM: el PC es la fuente de verdad y reenvía la suya en cada handshake (ADR-024). Así no hay una segunda copia que pueda quedar desfasada, y un cambio en el TOML se aplica al conectar sin ningún paso de grabación.
+- **LED de estado** en el pin 13: parpadea cada 500 ms durante el calentamiento y después copia el nivel del PIR, que es lo que sirve para orientar el sensor y para ver de un vistazo que hay detección. El estado de enlace se ve en la ventana, no en la placa.
+- **Longitud máxima de línea** de 96 bytes en el downlink (`CMD_CAP`); las líneas más largas se descartan hasta el siguiente salto y se contesta `{"t":"err","code":"oversize"}`. El uplink cabe de sobra en los 512 bytes que acepta el PC.
+- **Sin memoria dinámica.** No se usa `String`, ni `malloc`, ni `new`: todos los buffers son de tamaño fijo, para no fragmentar los 8 KB del Mega con una aplicación que va a estar meses encendida.
+
+Compilado con `arduino-cli` para `arduino:avr:mega`: **15 404 bytes de flash (6 %)** y **1 018 bytes de RAM global (12 %)**, con el watchdog incluido.
+
+### 4.5 Límites conocidos
+
+Lo que el sistema **no** hace, dicho antes de que lo descubra quien lo audite:
+
+- **Sin SAI ni batería de respaldo.** Un corte de luz deja muda la alarma: el PC se apaga y el Mega pierde la alimentación. La detección de movimiento de las horas sin corriente no existe, y no hay aviso de que faltó. Es el límite más importante del conjunto y está en las preguntas abiertas (§12.3).
+- **Sin supervisión de línea.** No hay resistencia de fin de línea ni detección de cable cortado: un PIR desconectado se lee como «sin movimiento» y el sistema sigue diciendo que vigila. Lo que sí se detecta es la placa entera, por el latido: si deja de llegar, la ventana lo dice.
+- **El piezo solo señaliza.** La «sirena» es un zumbador pasivo de placa, no una sirena de potencia: dos minutos de pitido agudo dentro de la caja, no un aviso que se oiga en la calle. Una sirena de verdad necesita relé y fuente aparte (F5).
+- **Sin teclado físico.** No hay teclado de membrana ni RFID: el mando es por ntfy con clave o TOTP. Si se cae la red o el PC, no queda forma local de desarmar salvo la ventana del propio PC, que está al lado de la alarma por definición.
+- **Un solo sensor, una sola zona.** El antirrebote y el calentamiento son por placa, no por zona, porque no hay más zonas. Un PIR defectuoso que se quede en alto mantiene el sistema en `DISPARADA` hasta que alguien lo desarme: hay rearme con tope justo por eso.
+- **El watchdog del PC es el latido**, no un `wdt` del sistema operativo: si la ventana se cuelga, la placa sigue detectando y pitando, pero los avisos se quedan en la cola hasta que la ventana vuelva.
 
 ---
 
@@ -824,7 +840,7 @@ desde F1.5). Los retardos de entrada y salida llegaron en F1.6.
 
 ### 9.3 Configuración del dispositivo
 
-La configuración de la zona (pin, calentamiento, antirrebote) se envía al Arduino al conectar y se persiste en EEPROM para que sobreviva a reinicios. El PC es la fuente de verdad: al arrancar, siempre reenvía su configuración y el Arduino la adopta.
+La configuración de la zona (pin, calentamiento, antirrebote) se envía al Arduino al conectar y vive en su RAM, no en EEPROM. El PC es la fuente de verdad: al arrancar, siempre reenvía su configuración y el Arduino la adopta, así que un reinicio de la placa (o abrir el puerto, que la reinicia por DTR) se resuelve solo en el handshake. Guardarla en la placa crearía una segunda copia que podría quedar desfasada respecto al TOML y hacer que la placa obedeciera ajustes que la ventana ya no muestra.
 
 ---
 
@@ -1553,6 +1569,7 @@ Recomendación: correo y ntfy como canales principales —los dos gratuitos— y
 | Firmata | Protocolo genérico para controlar pines de un microcontrolador desde un PC. |
 | NDJSON | *Newline Delimited JSON*: un objeto JSON por línea. |
 | Heartbeat | Latido periódico que demuestra que el dispositivo sigue vivo. |
+| Watchdog | Contador de hardware que reinicia la placa si el programa deja de darle señal de vida durante el plazo configurado. |
 | `seq` | Número de secuencia que permite detectar pérdidas y duplicados. |
 | FSM | *Finite State Machine*: máquina de estados finita. |
 | TTS | *Text To Speech*: síntesis de voz. |

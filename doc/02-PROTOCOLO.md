@@ -41,11 +41,11 @@ Todos los mensajes llevan el campo `t` con el tipo.
 Se emite al arrancar y cada vez que el PC lo pide con `cmd <id> hello`.
 
 ```json
-{"t":"hello","proto":1,"dev":"mega-pir","fw":"1.4.1","boot":0,
+{"t":"hello","proto":1,"dev":"mega-pir","fw":"1.6.0","boot":0,
  "zones":[{"id":1,"pin":2,"name":"pir"}],
  "caps":["hello","set","replay","calibrate","beep"],
  "cfg":{"warmup_ms":60000,"debounce_ms":50,"hb_ms":2000,"calib_window_ms":5000,
-        "buzzer_pin":11,"buzzer":1,"armed":0}}
+        "buzzer_pin":11,"buzzer":1,"armed":0,"wdt_rst":0}}
 ```
 
 `boot` es el `millis()` del arranque. Como vale ~0 siempre, sirve para detectar
@@ -57,6 +57,11 @@ los suyos al recibir `hello`.
 
 `cfg.buzzer_pin` es el pin real, el de `PIN_BUZZER` en el sketch; el
 `[buzzer].pin` del TOML es solo informativo y no viaja a la placa.
+
+`cfg.wdt_rst` vale `1` si el arranque anterior lo provoco el watchdog de 8 s en
+vez de un reset normal, un tiron del USB o la apertura del puerto. Es un dato de
+diagnostico, no de estado: el PC puede registrarlo para distinguir «la placa se
+cayo y se levanto sola» de «alguien la desconecto». 
 
 **El `hello` tiene que ser JSON valido en una sola linea.** Al construirse con
 varios `Serial.print`, una coma de mas al final de un literal deja `,,` y el PC

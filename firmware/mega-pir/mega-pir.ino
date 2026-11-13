@@ -43,15 +43,21 @@
  *   Zumbador pasivo (-) -> Mega GND (el de al lado de D13)
  *
  * Sin delay(): todo con millis(). Sin dependencias externas.
+ *
+ * Watchdog de 8 s: si el bucle se cuelga (una interrupcion que se pierde, una
+ * escritura que no vuelve), la placa se reinicia sola en vez de quedarse muda
+ * para siempre. El PC ve el latido desaparecer y luego el `hello` de la placa
+ * reiniciada, con `cfg.wdt_rst` a 1 en ese primer saludo.
  */
 
+#include <avr/wdt.h>
 #include <string.h>
 
 // ---------------------------------------------------------------------------
 // Identidad y pines
 // ---------------------------------------------------------------------------
 
-const char FW_VERSION[] = "1.5.0";
+const char FW_VERSION[] = "1.6.0";
 
 const uint8_t PIN_PIR = 2;     // INT4 en el Mega
 const uint8_t PIN_LED = 13;    // LED integrado
@@ -125,6 +131,9 @@ uint32_t g_tLastBlink  = 0;
 bool     g_ledState    = false;
 bool     g_armed       = false;  // lo fija el PC: solo pita si esta armado
 bool     g_buzzerOn    = true;   // interruptor independiente del PC
+// El arranque anterior termino por el watchdog, no por un reset normal, un
+// tiron del USB o abrir el puerto. Solo se puede saber en el primer hello.
+bool     g_wdtReset    = false;
 uint32_t g_rawBaseline = 0;
 uint32_t g_accepted    = 0;
 uint32_t g_noiseSent   = 0;
@@ -499,6 +508,9 @@ void emitHello() {
   Serial.print(F(",\"buzzer_pin\":"));     Serial.print(PIN_BUZZER);
   Serial.print(F(",\"buzzer\":"));         Serial.print(g_buzzerOn ? 1 : 0);
   Serial.print(F(",\"armed\":"));          Serial.print(g_armed ? 1 : 0);
+  // `wdt_rst` solo puede valer 1 en el hello que sigue a un reinicio del
+  // watchdog: es la unica prueba de que la placa se cayo y se levanto sola.
+  Serial.print(F(",\"wdt_rst\":"));        Serial.print(g_wdtReset ? 1 : 0);
   Serial.println(F("}}"));
 }
 
@@ -857,6 +869,15 @@ void pollSerial() {
 // ---------------------------------------------------------------------------
 
 void setup() {
+  // Lo primero de todo, antes de Serial: si el arranque anterior fue por el
+  // watchdog, MCUSR trae WDRF puesto y el perro sigue armado. Leerlo, limpiarlo
+  // y desactivarlo aqui evita el bucle de reinicios que deja la placa muerta
+  // cuando el gestor de arranque tambien se reinicia.
+  const uint8_t mcusr = MCUSR;
+  MCUSR = 0;
+  wdt_disable();
+  g_wdtReset = (mcusr & _BV(WDRF)) != 0;
+
   pinMode(PIN_PIR, INPUT);   // el HC-SR501 tiene salida push-pull
   pinMode(PIN_LED, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
@@ -874,9 +895,18 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(PIN_PIR), onPirEdge, CHANGE);
 
   emitHello();
+
+  // Todo listo: a partir de aqui, si loop() deja de dar senal de vida 8 s, la
+  // placa se reinicia sola. Se arma al final para que el arranque (que incluye
+  // el hello) no cuente contra el plazo.
+  wdt_enable(WDTO_8S);
 }
 
 void loop() {
+  // La unica condicion para no reiniciarse es seguir pasando por aqui. Todas
+  // las ramas de loop() vuelven en menos de 500 ms (la del calentamiento
+  // tambien, aunque haga `return`), asi que este punto basta como señal de vida.
+  wdt_reset();
   pollSerial();
 
   const uint32_t now = millis();
