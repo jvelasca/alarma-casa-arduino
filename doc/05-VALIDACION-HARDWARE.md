@@ -11,7 +11,7 @@ verdad conectados.
 | Documento | `doc/05-VALIDACION-HARDWARE.md` |
 | Versión | 1.1 |
 | Fecha | 2026-11-13 |
-| Estado | **En ejecución** — HW-01 `PASS`; el resto pendiente |
+| Estado | **En ejecución** — HW-01 y HW-02 `PASS`; el resto pendiente |
 | Ámbito | Arduino Mega 2560 + HC-SR501 + zumbador pasivo + aplicación de escritorio |
 | Software de referencia | `a61198a` — versión **0.1.5**, firmware **1.7.0** |
 | Audiencia | Quien monta, flashea y valida el equipo; mantenimiento |
@@ -47,7 +47,7 @@ fase posterior, con su propio PR y su propia revisión.
 |---|---|---|---|
 | Software en simulación | Lógica de la FSM, protocolo, persistencia, avisos | `pytest`, `tools/alarmctl.py --sim info`, Qt *offscreen* | **Certificado** (616 pruebas, §1) |
 | Compilación del firmware | El sketch compila para `arduino:avr:mega` | HW-01 | **PASS** |
-| Enlace serie real | `hello`, `hb`, `evt`, `ack` sobre USB | HW-02, HW-03A | Pendiente |
+| Enlace serie real | `hello`, `hb`, `evt`, `ack` sobre USB | HW-02, HW-03A | **PASS** (HW-02: `hello` y `hb`); `evt`/`ack` pendientes |
 | Errores de comando | `err` con `badop` y `oversize` | HW-03B | **BLOQUEADO** (sin remitente de líneas crudas) |
 | Buffer y ACK | 16 eventos, reenvío, `lost`, deduplicación | HW-04 | Pendiente |
 | Durabilidad | SQLite `FULL`, spool, recuperación tras corte | HW-05 | Pendiente |
@@ -68,6 +68,8 @@ Dos reglas de lectura:
 Se rellena una vez por sesión de pruebas y se repite si cambia cualquier
 elemento. Sin estos datos, una fila de resultado no es interpretable.
 
+### Sesión 1 — 2026-11-13 23:24, solo compilación (HW-01)
+
 | Campo | Valor |
 |---|---|
 | Fecha y hora de inicio | 2026-11-13 23:24 |
@@ -85,10 +87,10 @@ elemento. Sin estos datos, una fila de resultado no es interpretable.
 | Configuración cargada | — (no aplica: HW-01 no carga `config/alarm.toml`) |
 | Jumper del HC-SR501 y ajuste | — (no aplica: el sensor no se conecta en HW-01; se anota en HW-02) |
 
-Al empezar la sesión de HW-02 se abre una hoja nueva: la placa, el cable, la
+Al empezar una sesión nueva se abre otra hoja: la placa, el cable, la
 alimentación y el ajuste del PIR solo se pueden declarar cuando se prueban.
 
-Comandos ejecutados en esta sesión, desde la raíz del proyecto:
+Comandos de la sesión 1, desde la raíz del proyecto:
 
 ```powershell
 # Herramientas de compilación: la misma ruta que usa flash.ps1
@@ -99,12 +101,34 @@ $cli = Join-Path $env:LOCALAPPDATA 'Programs\Arduino IDE\resources\app\lib\backe
 
 Los comandos de identificación del dispositivo (`alarmctl.py ports` y
 `alarmctl.py info`) no forman parte de una sesión de solo compilación: `info`
-abre el puerto y reinicia la placa por DTR. Se ejecutan al empezar HW-02, con la
-hoja de banco de esa sesión delante.
+abre el puerto y reinicia la placa por DTR. Se reservan para la sesión de HW-02.
 
 `scripts/flash.ps1` localiza `arduino-cli` en `%LOCALAPPDATA%` o en
 `%ProgramFiles%`, y solo recurre al `PATH` si no está en ninguno de los dos
 sitios. Que `arduino-cli` no esté en el `PATH` no impide compilar.
+
+### Sesión 2 — 2026-11-14 00:10, placa conectada y flasheada (HW-02)
+
+| Campo | Valor |
+|---|---|
+| Fecha y hora de inicio | 2026-11-14 00:10 |
+| Operador | jvelasca |
+| Alcance de la sesión | Flasheo, `hello`, `boot_id` y omisión del calentamiento (HW-02) |
+| Placa (modelo y origen) | Mega 2560 con adaptador CH340 (`VID_1A86`, `PID_7523`), `COM3` |
+| Puerto | `COM3`, detectado por VID/PID por `flash.ps1` y por `serial_watch.ps1` |
+| Alimentación | Solo USB (5 V). No se conectó `VIN`; `VIN` se prueba en HW-04B |
+| Cable USB | Datos: la subida por `avrdude` completó, un cable de solo carga no lo permitiría |
+| `arduino-cli` (ruta y versión) | 1.5.1 — `%LOCALAPPDATA%\Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe` |
+| Core `arduino:avr` | 1.8.8 |
+| Windows | Windows 11 Pro 10.0.26200 |
+| Firmware anunciado en `hello` | `1.7.0` |
+| Commit bajo prueba | `a61198a` (firmware y software); el árbol incluye commits que solo tocan este documento |
+| Configuración cargada | — (sin ventana abierta: la sesión se hizo con `alarmctl` y `serial_watch`) |
+| Jumper del HC-SR501 y ajuste | — (no se ajustó ni se comprobó en esta sesión; se anota al probar el sensor) |
+
+La placa llegó a esta sesión con el sketch ya subido por `flash.ps1`
+(16 048 B de flash, 1 022 B de RAM). Los `hello` capturados muestran
+`boot_id` 3 y 4: el contador sube en cada reinicio por DTR.
 
 ## 4. Protocolo de evidencia
 
@@ -132,8 +156,8 @@ sitios. Que `arduino-cli` no esté en el `PATH` no impide compilar.
 
 1. **HW-01** primero: si no compila, no hay nada que probar. **PASS.**
 2. **HW-02** y **HW-03A**: enlace y órdenes, que es la base de todo lo demás.
-   HW-03B y el rechazo con `buzzer=0` constan `BLOQUEADO`: no interrumpen el
-   orden.
+   HW-02 `PASS`; HW-03B y el rechazo con `buzzer=0` constan `BLOQUEADO` y no
+   interrumpen el orden.
 3. **HW-06**: sirena y FSM, con la ventana abierta y plazos acortados.
 4. **HW-04** y **HW-05**: desconexiones y cortes, que ensucian el estado y se
    hacen mejor con el resto ya validado.
@@ -267,7 +291,31 @@ paso 5 mostrando que no se esperan 60 s.
 
 | Resultado | Fecha | Operador | Evidencia |
 |---|---|---|---|
-| pendiente | | | |
+| **PASS** | 2026-11-14 00:14 | jvelasca | `data\validacion\HW-02-20261114-0014-hello-a.log`, `-hello-b.log` y `HW-02-20261114-0015-skipwarmup.log` |
+
+Extracto de los dos `hello` (el prefijo `<ms> ms |` de `serial_watch` recortado):
+
+```
+{"t":"hello","proto":1,"dev":"mega-pir","fw":"1.7.0","boot":6,"boot_id":3,"zones":[{"id":1,"pin":2,"name":"pir"}],
+ "caps":["hello","set","replay","calibrate","beep"],
+ "cfg":{"warmup_ms":60000,"debounce_ms":50,"hb_ms":2000,"calib_window_ms":5000,"buzzer_pin":11,"buzzer":1,"armed":0,"wdt_rst":0}}
+{"t":"hello","proto":1,"dev":"mega-pir","fw":"1.7.0","boot":6,"boot_id":4, ... resto idéntico ...}
+```
+
+`boot` vale 6 ms en los dos arranques —no distingue sesiones— y `boot_id` sube
+de 3 a 4, que es exactamente lo que documenta
+[`02-PROTOCOLO.md`](02-PROTOCOLO.md). `alarmctl.py info` sobre la misma sesión
+confirma `dispositivo mega-pir (protocolo v1)`, `firmware 1.7.0`, `zona 1: pir
+en D2`, `buzzer_pin 11`, `warmup_ms 60000` y `wdt_rst 0`, y no imprime `boot_id`.
+
+Paso 5: `monitor --seconds 20 --skip-warmup` abrió el puerto, reinició la placa
+por DTR y cerró el calentamiento en **0 ms** («PIR listo tras 0 ms de
+calentamiento»), sin esperar los 60 s. La sesión dejó 9 latidos con `buf: 0` y
+`lost: 0`, y ningún evento.
+
+La subida con `flash.ps1` detectó `COM3` por VID/PID (CH340), compiló con los
+mismos 16 048 B de flash y 1 022 B de RAM de HW-01 y terminó con «Subida
+completada en COM3».
 
 ### HW-03 — Órdenes del protocolo y acuses
 
@@ -709,7 +757,7 @@ sin cubrir el criterio de F4.
 | ID | Escenario | Fecha | Operador | Placa / puerto | Firmware | Resultado | Evidencia |
 |---|---|---|---|---|---|---|---|
 | HW-01 | Compilación reproducible | 2026-11-13 23:24 | jvelasca | — (compilación, sin placa) | 1.7.0 | **PASS** | `data\validacion\HW-01-20261113-2324-compile.log` |
-| HW-02 | Flasheo, sesión y saludo | | | | | pendiente | |
+| HW-02 | Flasheo, sesión y saludo | 2026-11-14 00:14 | jvelasca | `COM3` | 1.7.0 | **PASS** | `data\validacion\HW-02-20261114-0014-hello-{a,b}.log`, `HW-02-20261114-0015-skipwarmup.log` |
 | HW-03A | Órdenes y patrones del zumbador | | | | | pendiente (rechazo con `buzzer=0`: **BLOQUEADO**) | |
 | HW-03B | `err` por `badop`/`oversize` | 2026-11-13 | jvelasca | — | 1.7.0 | **BLOQUEADO** | — sin remitente de líneas crudas (§6 HW-03B) |
 | HW-04A | Tirón de USB (reinicio) | | | | | pendiente | |
@@ -776,8 +824,8 @@ La formulación que se puede sostener mientras falte algo de lo anterior es la
 misma que la del cierre de software:
 
 > Versión 0.1.5 integrada en `main`, revisión de software cerrada y CI en verde.
-> Certificación de hardware pendiente: compilación superada (HW-01 `PASS`),
-> flasheo y pruebas físicas sin ejecutar.
+> Certificación de hardware pendiente: compilación y flasheo superados (HW-01 y
+> HW-02 `PASS`), pruebas de comportamiento físico sin ejecutar.
 
 Cuando la campaña termine, será este documento —y no una impresión— lo que
 permita cambiar esa frase.
