@@ -47,6 +47,7 @@ class SimulatedLink:
         self._queue: list[str] = []
 
         self._seq = 0
+        self._boot_id = 0
         self._level = False
         self._raw = 0
         self._lost = 0
@@ -93,6 +94,10 @@ class SimulatedLink:
 
     def open(self) -> None:
         self._open = True
+        # Abrir el puerto reinicia la placa (DTR): la sesion cambia y `seq`
+        # vuelve a 1. El simulado imita al firmware 1.7.0, `boot_id` incluido.
+        self._boot_id += 1
+        self._seq = 0
         self._t0 = time.monotonic()
         self._next_hb = 0.0
         self._queue.append(self._hello_json())
@@ -205,6 +210,7 @@ class SimulatedLink:
                 "dev": "mega-pir",
                 "fw": FW_VERSION,
                 "boot": 1234,
+                "boot_id": self._boot_id,
                 "zones": [{"id": 1, "pin": 2, "name": "pir"}],
                 "caps": ["hello", "set", "replay", "calibrate", "beep"],
                 "cfg": {

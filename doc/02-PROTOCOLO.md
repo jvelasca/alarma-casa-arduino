@@ -41,15 +41,25 @@ Todos los mensajes llevan el campo `t` con el tipo.
 Se emite al arrancar y cada vez que el PC lo pide con `cmd <id> hello`.
 
 ```json
-{"t":"hello","proto":1,"dev":"mega-pir","fw":"1.6.0","boot":0,
+{"t":"hello","proto":1,"dev":"mega-pir","fw":"1.7.0","boot":0,"boot_id":37,
  "zones":[{"id":1,"pin":2,"name":"pir"}],
  "caps":["hello","set","replay","calibrate","beep"],
  "cfg":{"warmup_ms":60000,"debounce_ms":50,"hb_ms":2000,"calib_window_ms":5000,
         "buzzer_pin":11,"buzzer":1,"armed":0,"wdt_rst":0}}
 ```
 
-`boot` es el `millis()` del arranque. Como vale ~0 siempre, sirve para detectar
-un reinicio: si cambia respecto al anterior, la placa se reinicio.
+`boot` es el `millis()` del arranque. Vale ~0 en todos los arranques, asi que
+**no sirve para distinguir una sesion de otra**: dos reinicios seguidos pueden
+dar el mismo `0`.
+
+`boot_id` es la identidad real de la sesion: un contador de 32 bits guardado en
+la EEPROM que sube en cada arranque. El firmware lo escribe en dos ranuras
+alternas (`0x00` y `0x10`) con magic y CRC16, de modo que un corte a mitad de
+escritura no lo destruye, y reparte el desgaste entre las dos. Solo se escribe
+**una vez por arranque**, nunca en `loop()`.
+
+`boot_id` se anuncia pero no viaja en cada `evt`: el PC lo inyecta al despachar
+el evento, para que no haya carrera entre el saludo y el primer evento.
 
 `cfg.buzzer` y `cfg.armed` reflejan el estado en RAM del dispositivo, no la
 configuracion del PC: al reiniciar por DTR vuelven a `1` y `0`. El PC reenvia
@@ -59,9 +69,15 @@ los suyos al recibir `hello`.
 `[buzzer].pin` del TOML es solo informativo y no viaja a la placa.
 
 `cfg.wdt_rst` vale `1` si el arranque anterior lo provoco el watchdog de 8 s en
-vez de un reset normal, un tiron del USB o la apertura del puerto. Es un dato de
-diagnostico, no de estado: el PC puede registrarlo para distinguir «la placa se
-cayo y se levanto sola» de «alguien la desconecto». 
+vez de un reset normal, un tiron del USB o la apertura del puerto. El PC lo usa
+para etiquetar el motivo del reinicio (`watchdog` frente a `power`) y lo deja en
+`DeviceManager.last_reboot_reason`. 
+
+**Firmware 1.6.0 y anteriores no envian `boot_id`.** El PC sigue funcionando con
+ellos, pero la deduplicacion entre reconexiones no puede garantizarse: sin
+identidad de sesion solo queda `boot`, que casi siempre vale lo mismo. El gestor
+lo registra como sesion no fiable (`Stats.legacy_sessions`) y lo escribe en el
+log. Con el firmware 1.7.0 el problema desaparece.
 
 **El `hello` tiene que ser JSON valido en una sola linea.** Al construirse con
 varios `Serial.print`, una coma de mas al final de un literal deja `,,` y el PC
@@ -238,23 +254,51 @@ emparejar peticion y respuesta.
 
 - **Secuencia.** El dispositivo numera los eventos. El PC los acusa con
   `ackevt` y el dispositivo los libera del buffer circular (16 posiciones).
-- **Acuse diferido.** `ackevt` no significa «recibido» sino «procesado»: la
-  ventana lo manda despues de aplicar el evento y guardarlo en SQLite, y es el
-  hilo lector quien escribe el numero en el puerto. Si el PC se cierra en ese
-  hueco, el evento sigue en el buffer de la placa.
+- **Acuse diferido y durable.** `ackevt` no significa «recibido» sino
+  «procesado y guardado». La ventana lo manda **solo** despues de que el evento
+  exista en SQLite (transaccion con el evento, su clave y el snapshot de la
+  maquina de estados) o, si la base falla, en el buzon `data/spool/` con
+  `fsync`. Si ninguna de las dos escrituras funciona, **no hay `ackevt`**: la
+  placa conserva el evento y lo reenvia. Es el hilo lector quien escribe el
+  numero en el puerto.
+- **Deduplicacion por `(boot_id, seq)`.** Es la clave primaria de la tabla
+  `processed_events`. Un evento repetido se vuelve a confirmar para que la placa
+  lo borre, pero no alimenta otra vez la maquina de estados ni lanza un segundo
+  aviso. La prueba se guarda 30 dias, muy por encima de cualquier reconexion
+  real.
 - **Replay.** Al recibir el primer `hello` de cada sesion, el PC pide
   `cmd replay`: la placa reemite los eventos que siguen sin acusar. Los ya
-  procesados se descartan por `(boot, seq)` y se cuentan como duplicados.
+  procesados no repiten efectos, se cuentan en `stats.duplicates` y **se
+  vuelven a acusar** (`ack_events(..., repeat=True)`). Sin ese segundo
+  `ackevt`, un ACK perdido con el cable dejaria el evento en el buffer de la
+  placa para siempre hasta llenar sus 16 posiciones.
 - **Desbordamiento.** Si el buffer se llena, se descarta el mas antiguo y se
-  incrementa `lost`, que viaja en cada latido. Nunca se pierde en silencio.
-- **Reconexion.** Al abrir el puerto, el DTR reinicia la placa y `seq` vuelve a
-  1, asi que el acuse se reinicia en cada apertura. El campo `boot` es
-  `millis()` en el arranque (practicamente 0) y no sirve como identidad de
-  sesion; el reinicio se reconoce por el propio cierre y reapertura del enlace.
+  incrementa `lost`, que viaja en cada latido. Nunca se pierde en silencio: el
+  PC lo muestra al recibir el latido.
+- **Reconexion.** Abrir el puerto ya **no** reinicia el acuse por si acaso. El
+  acuse se reinicia cuando el `hello` demuestra que la sesion es otra
+  (`boot_id` distinto) o cuando un `hb.up` que retrocede delata un reinicio que
+  no se vio. Si el adaptador no pulsa DTR y la placa sigue en la misma sesion,
+  el acuse se conserva. Con firmware 1.6.0 (sin `boot_id`) se mantiene la
+  heuristica por `boot`, que no es fiable entre arranques.
+- **Eventos antes del saludo.** Un `evt` que llega antes del `hello` se aparca
+  (hasta 64) y se despacha cuando llega el saludo, ya con el `boot_id` de la
+  sesion. Nunca se entrega sin identidad.
+- **Acuse de una sesion anterior.** `ack_events(seq, boot_id)` ignora un acuse
+  cuyo `boot_id` no es el de la sesion actual, **incluido** el intervalo en que
+  aun no se conoce la sesion nueva (`_boot_id is None`, entre detectar un
+  reinicio por regresion de `up_ms` y recibir su `hello`). Si no, confirmar el
+  `seq` de la placa reiniciada borraria eventos de la sesion nueva, que empieza
+  otra vez en 1. El ACK pendiente lleva ademas una generacion de sesion que se
+  comprueba justo antes de escribir, y `_flush_control()` manda primero el
+  `hello` y despues el `ackevt`: un acuse nunca sale sin sesion identificada.
 - **Lineas invalidas.** Se descartan y se cuentan en `stats.decode_errors`.
   Nunca detienen el bucle de lectura.
 - **Latido.** Si no llega ninguna linea durante `hb_timeout` (8 s por defecto),
   el enlace se marca `OFFLINE`.
+- **Limite real.** El buffer de la placa sigue viviendo en RAM: un reset por
+  watchdog con 16 eventos sin confirmar los pierde, y el PC lo vera en `lost`.
+  El buzon del PC cubre el fallo del disco, no el de la placa.
 
 ---
 
@@ -263,7 +307,7 @@ emparejar peticion y respuesta.
 Abrir el puerto serie pone DTR en bajo y **reinicia el microcontrolador**. Eso
 tiene dos consecuencias:
 
-1. El firmware arranca de cero: `boot` cambia, `seq` vuelve a 1 y empieza un
+1. El firmware arranca de cero: `boot_id` sube, `seq` vuelve a 1 y empieza un
    calentamiento de 60 s.
 2. El HC-SR501 **no se apaga**: su alimentacion viene del rail de 5 V del Mega
    y el sensor conserva su estabilizacion termica.

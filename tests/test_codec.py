@@ -41,6 +41,7 @@ def test_hello_completo() -> None:
         dev="mega-pir",
         fw="1.1.0",
         boot=1234,
+        boot_id=42,
         zones=[{"id": 1, "pin": 2, "name": "pir"}],
         caps=["calibrate"],
         cfg={"warmup_ms": 60000},
@@ -50,6 +51,15 @@ def test_hello_completo() -> None:
     assert msg.dev == "mega-pir"
     assert msg.zones[0].pin == 2
     assert msg.cfg["warmup_ms"] == 60000
+    assert msg.boot_id == 42
+
+
+def test_hello_sin_boot_id_es_firmware_antiguo() -> None:
+    """1.6.0 y anteriores no lo envian: queda en ``None``, no revienta."""
+    raw = _line(t="hello", proto=1, dev="d", fw="1.6.0", boot=0, zones=[])
+    msg = decode_line(raw)
+    assert isinstance(msg, Hello)
+    assert msg.boot_id is None
 
 
 def test_hello_sin_cfg_usa_valores_por_defecto() -> None:
@@ -229,3 +239,19 @@ REAL_LINES = [
 @pytest.mark.parametrize("raw", REAL_LINES)
 def test_lineas_reales_del_dispositivo(raw: str) -> None:
     assert decode_line(raw) is not None
+
+
+# -- Identidad de sesion ----------------------------------------------------
+
+
+def test_el_evento_no_trae_boot_id_y_lo_inyecta_el_gestor() -> None:
+    from dataclasses import replace
+
+    event = decode_line('{"t":"evt","seq":5,"kind":"motion.start","z":1,"ms":10}')
+    assert isinstance(event, MotionEvent)
+    assert event.boot_id is None
+
+    etiquetado = replace(event, boot_id=77)
+    assert etiquetado.boot_id == 77
+    assert etiquetado.seq == 5
+    assert event.boot_id is None, "replace no muta el original"

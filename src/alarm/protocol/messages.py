@@ -39,6 +39,10 @@ class Hello:
     zones: tuple[Zone, ...]
     caps: tuple[str, ...]
     cfg: Mapping[str, int] = field(default_factory=dict)
+    # Identidad de la sesion. `boot_ms` vale ~0 siempre, asi que no distingue
+    # un arranque de otro; `boot_id` si. `None` significa firmware antiguo
+    # (1.6.0 y anteriores), que no lo envia: el PC lo trata como no fiable.
+    boot_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +69,10 @@ class MotionEvent:
     ms: int
     dur_ms: int | None = None
     noise: int | None = None
+    # Lo rellena el gestor con el `boot_id` de la sesion en la que se recibio
+    # (la linea `evt` no lo trae para no alargar el enlace). Con el forma la
+    # clave (boot_id, seq) que hace idempotente el procesamiento.
+    boot_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

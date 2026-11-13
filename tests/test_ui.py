@@ -529,29 +529,167 @@ def test_deteccion_desarmada_no_dispara(window) -> None:
     assert len(window._speech.spoken) == antes
 
 
-def test_el_evento_se_confirma_solo_despues_de_registrarlo(window) -> None:
-    """El ACK va al final: recibir no es lo mismo que haber procesado."""
+def test_el_evento_se_confirma_solo_despues_de_guardarlo(window) -> None:
+    """El ACK va al final: recibir no es lo mismo que haber persistido.
+
+    H-01: antes se confirmaba aunque SQLite fallara, y el firmware borraba el
+    evento. Ahora la confirmacion depende de una escritura durable.
+    """
     from alarm.protocol.messages import MotionEvent, MotionKind
 
     manager = FakeManager()
     window._manager = manager
-    order: list[str] = []
-    original = window._log_event
-
-    def log_event(tag: str, kind: str, detail: str) -> None:
-        order.append("log")
-        original(tag, kind, detail)
-
-    window._log_event = log_event  # type: ignore[method-assign]
     window.disarm()
 
-    window._on_message(MotionEvent(seq=7, kind=MotionKind.START, zone=1, ms=1000))
-    assert manager.acked == [7]
-    assert order == ["log"], "no se confirma antes de registrar"
+    calls: list[str] = []
+    original = window._store.record_motion
 
-    # El fin del pulso tambien se confirma: si no, el buffer se llenaria.
-    window._on_message(MotionEvent(seq=8, kind=MotionKind.END, zone=1, ms=1200, dur_ms=200))
-    assert manager.acked == [7, 8]
+    def record_motion(*args: object, **kwargs: object) -> object:
+        calls.append("persist")
+        return original(*args, **kwargs)  # type: ignore[arg-type]
+
+    window._store.record_motion = record_motion  # type: ignore[method-assign]
+    try:
+        window._on_message(MotionEvent(seq=7, kind=MotionKind.START, zone=1, ms=1000, boot_id=1))
+        assert manager.acked == [7]
+        assert calls == ["persist"], "no se confirma antes de guardar"
+
+        # El fin del pulso tambien se confirma: si no, el buffer se llenaria.
+        window._on_message(
+            MotionEvent(seq=8, kind=MotionKind.END, zone=1, ms=1200, dur_ms=200, boot_id=1)
+        )
+        assert manager.acked == [7, 8]
+    finally:
+        window._store.record_motion = original  # type: ignore[method-assign]
+
+
+def test_si_no_se_puede_guardar_ni_en_el_buzon_no_hay_ack(window) -> None:
+    """H-01: si no hay escritura durable, la placa conserva el evento."""
+    from alarm.protocol.messages import MotionEvent, MotionKind
+
+    manager = FakeManager()
+    window._manager = manager
+    window.disarm()
+
+    def romper(*args: object, **kwargs: object) -> object:
+        raise OSError("disco lleno")
+
+    original_record = window._store.record_motion
+    original_append = window._spool.append
+    window._store.record_motion = romper  # type: ignore[method-assign]
+    window._spool.append = lambda record: False  # type: ignore[method-assign, assignment]
+    try:
+        window._on_message(MotionEvent(seq=11, kind=MotionKind.START, zone=1, ms=1000, boot_id=1))
+        assert manager.acked == [], "sin persistencia no se puede confirmar"
+        assert not window._storage_warning.isHidden()
+    finally:
+        window._store.record_motion = original_record  # type: ignore[method-assign]
+        window._spool.append = original_append  # type: ignore[method-assign]
+
+
+def test_si_sqlite_falla_el_buzon_permite_confirmar(window, tmp_path) -> None:
+    """La segunda linea de defensa: el buzon con fsync tambien es durable."""
+    from alarm.protocol.messages import MotionEvent, MotionKind
+
+    manager = FakeManager()
+    window._manager = manager
+    window.disarm()
+
+    def romper(*args: object, **kwargs: object) -> object:
+        raise OSError("base bloqueada")
+
+    original = window._store.record_motion
+    window._store.record_motion = romper  # type: ignore[method-assign]
+    try:
+        window._on_message(MotionEvent(seq=21, kind=MotionKind.START, zone=1, ms=1000, boot_id=1))
+        assert manager.acked == [21]
+        assert window._spool.pending == 1
+        assert list((tmp_path / "spool").glob("*.jsonl"))
+    finally:
+        window._store.record_motion = original  # type: ignore[method-assign]
+
+
+def test_un_evento_ya_procesado_se_reconfirma_sin_repetir_efectos(window) -> None:
+    """Tras reconectar, el mismo (boot_id, seq) no dispare dos veces."""
+    from alarm.protocol.messages import MotionEvent, MotionKind
+
+    manager = FakeManager()
+    window._manager = manager
+    window.disarm()
+    window.arm()
+    assert window._hero._state.text().startswith("ARMADA")
+
+    primero = MotionEvent(seq=5, kind=MotionKind.START, zone=1, ms=1000, boot_id=3)
+    window._on_message(primero)
+    assert window._hero._state.text() == "DISPARADA"
+
+    window.disarm()
+    assert window._hero._state.text() == "DESARMADA"
+
+    # El mismo evento llega otra vez (ACK perdido y replay): no vuelve a
+    # disparar la alarma, pero si se confirma para que la placa lo borre.
+    # El acuse es `repeat`: mismo numero, que la placa ya confirmo una vez,
+    # pero tiene que volver a escribirse o el evento se queda en su buffer.
+    manager.acked.clear()
+    manager.repeated.clear()
+    window._on_message(primero)
+    assert window._hero._state.text() == "DESARMADA"
+    assert manager.acked == [5]
+    assert manager.repeated == [5]
+
+
+def test_si_falla_la_persistencia_la_fsm_vuelve_atras(window) -> None:
+    """H-01: un evento no guardado no puede dejar la maquina avanzada.
+
+    Si `feed()` dejara la FSM en TRIGGERED y la escritura fallara, el reenvio
+    encontraria la maquina ya disparada, `feed()` devolveria None y la sirena
+    no sonaria nunca. El orden declarado es persistir y despues actuar.
+    """
+    from alarm.core.state import AlarmState
+    from alarm.protocol.messages import MotionEvent, MotionKind
+
+    manager = FakeManager()
+    window._manager = manager
+    window.disarm()
+    window.arm()
+    assert window._controller.state is AlarmState.ARMED
+
+    def romper(*args: object, **kwargs: object) -> object:
+        raise OSError("disco lleno")
+
+    original_record = window._store.record_motion
+    original_append = window._spool.append
+    window._store.record_motion = romper  # type: ignore[method-assign]
+    window._spool.append = lambda record: False  # type: ignore[method-assign, assignment]
+
+    evento = MotionEvent(seq=31, kind=MotionKind.START, zone=1, ms=1000, boot_id=1)
+    try:
+        voz_antes = len(window._speech.spoken)
+        avisos_antes = len(window._notifier.submitted)
+        window._on_message(evento)
+
+        assert window._controller.state is AlarmState.ARMED, "la FSM tiene que volver"
+        assert manager.acked == [], "sin persistencia no hay ACK"
+        assert len(window._speech.spoken) == voz_antes, "sin guardar no se avisa"
+        assert len(window._notifier.submitted) == avisos_antes
+    finally:
+        window._store.record_motion = original_record  # type: ignore[method-assign]
+        window._spool.append = original_append  # type: ignore[method-assign]
+
+    # La placa reenvia el evento y ahora si se puede guardar: los efectos de
+    # la transicion original tienen que ejecutarse, una sola vez.
+    window._on_message(evento)
+    assert window._controller.state is AlarmState.TRIGGERED
+    assert manager.acked == [31]
+    assert manager.repeated == []
+    assert len(window._notifier.submitted) == avisos_antes + 1
+
+    # Un segundo reenvio solo se reacusa: ni otra sirena ni otro aviso.
+    manager.acked.clear()
+    window._on_message(evento)
+    assert manager.acked == [31]
+    assert manager.repeated == [31]
+    assert len(window._notifier.submitted) == avisos_antes + 1
 
 
 def test_sin_gestor_el_evento_no_revienta_la_ventana(window) -> None:
@@ -633,6 +771,140 @@ def test_sin_estado_guardado_se_usa_armed_on_start(tmp_path) -> None:
     finally:
         instance.shutdown()
         instance.deleteLater()
+
+
+def _ventana_con_snapshot(tmp_path, snapshot: dict[str, object], **overrides: object):
+    """Ventana nueva sobre una base con un snapshot de la FSM ya escrito."""
+    import json
+
+    from alarm.services.storage import EventStore
+    from alarm.ui.app import MainWindow
+
+    path = tmp_path / "alarm.db"
+    store = EventStore(path)
+    store.set_state("armed_intent", "true")
+    store.set_state("armed_at", "1700000000")
+    store.set_state("alarm_snapshot", json.dumps(snapshot))
+    store.close()
+
+    base = default_config()
+    alarm: dict[str, object] = {"exit_delay_s": 0, "entry_delay_s": 30}
+    alarm.update(overrides)
+    instance = MainWindow(
+        simulated=True,
+        autoconnect=False,
+        config=replace(base, alarm=replace(base.alarm, **alarm)),  # type: ignore[arg-type]
+        config_path=tmp_path / "alarm.toml",
+        local_path=tmp_path / "alarm.local.toml",
+        env_path=tmp_path / ".env",
+        history_path=path,
+    )
+    instance._speech = FakeSpeech()  # type: ignore[assignment]
+    instance._notifier = FakeNotifier()  # type: ignore[assignment]
+    return instance
+
+
+def _snapshot(**kwargs: object) -> dict[str, object]:
+    values: dict[str, object] = {
+        "v": 1,
+        "state": "triggered",
+        "saved_at": time.time(),
+        "delay_remaining_s": None,
+        "delay_total_s": 0.0,
+        "siren_remaining_s": 120.0,
+        "silenced": False,
+        "rearm_count": 0,
+    }
+    values.update(kwargs)
+    return values
+
+
+def test_un_disparo_guardado_se_recupera_y_reanuda_la_sirena(tmp_path) -> None:
+    """H-03: cerrar con la alarma disparada no puede dejarla callada."""
+    from alarm.core.state import AlarmState
+
+    instance = _ventana_con_snapshot(tmp_path, _snapshot())
+    try:
+        assert instance._controller.state is AlarmState.TRIGGERED
+        assert instance._hero._state.text() == "DISPARADA"
+
+        manager = FakeManager()
+        instance._manager = manager
+        instance._resume_siren()
+
+        beeps = [params for op, params in manager.sent if op == "beep"]
+        assert beeps, "la sirena tiene que reanudarse"
+        # Le queda el tiempo del disparo original, no una sirena entera nueva.
+        assert 100_000 <= int(beeps[0]["ms"]) <= 120_000
+        assert instance._controller.siren_remaining_s() == pytest.approx(120, abs=1)
+    finally:
+        instance.shutdown()
+        instance.deleteLater()
+
+
+def test_un_retardo_de_entrada_vencido_dispara_al_arrancar(tmp_path) -> None:
+    from alarm.core.state import AlarmState
+
+    instance = _ventana_con_snapshot(
+        tmp_path,
+        _snapshot(
+            state="pending",
+            saved_at=time.time() - 600,
+            delay_remaining_s=30.0,
+            delay_total_s=30.0,
+            siren_remaining_s=None,
+        ),
+    )
+    try:
+        assert instance._controller.state is AlarmState.PENDING
+        instance._tick_delays()
+        assert instance._controller.state is AlarmState.TRIGGERED
+        assert instance._hero._state.text() == "DISPARADA"
+    finally:
+        instance.shutdown()
+        instance.deleteLater()
+
+
+def test_sin_base_el_arranque_avisa_de_registro_no_persistente(qapp, tmp_path) -> None:
+    """`:memory:` no sobrevive al cierre: la ventana no puede fingir que si."""
+    from alarm.ui.app import MainWindow
+
+    instance = MainWindow(
+        simulated=True,
+        autoconnect=False,
+        config=default_config(),
+        config_path=tmp_path / "alarm.toml",
+        local_path=tmp_path / "alarm.local.toml",
+        env_path=tmp_path / ".env",
+        history_path=":memory:",
+        spool_dir=tmp_path / "spool",
+    )
+    instance._speech = FakeSpeech()  # type: ignore[assignment]
+    instance._notifier = FakeNotifier()  # type: ignore[assignment]
+    try:
+        assert instance._store.persistent is False
+        assert not instance._storage_warning.isHidden()
+        assert "REGISTRO NO PERSISTENTE" in instance._storage_warning.text()
+    finally:
+        instance.shutdown()
+        instance.deleteLater()
+
+
+def test_si_falla_guardar_el_estado_no_se_da_por_guardado(window) -> None:
+    """El estado no se marca como persistido antes del commit."""
+
+    def romper(*args: object, **kwargs: object) -> None:
+        raise OSError("base bloqueada")
+
+    original = window._store.set_state_many
+    window._store.set_state_many = romper  # type: ignore[method-assign]
+    try:
+        window._state_fingerprint = None
+        window.arm()
+        assert window._persisted_armed is not True
+        assert window._state_fingerprint is None, "hay que reintentar en el proximo cambio"
+    finally:
+        window._store.set_state_many = original  # type: ignore[method-assign]
 
 
 def test_arrancar_con_restore_desactivado_ignora_la_base(tmp_path) -> None:
@@ -1199,13 +1471,18 @@ class FakeManager:
         self.link = None
         self.sent: list[tuple[str, dict[str, object]]] = []
         self.acked: list[int] = []
+        # Acuses de un evento ya guardado: deben salir otra vez para que la
+        # placa lo borre, aunque no se repitan los efectos.
+        self.repeated: list[int] = []
 
     def send(self, op: str, **params: object) -> int:
         self.sent.append((op, params))
         return 1
 
-    def ack_events(self, seq: int) -> None:
+    def ack_events(self, seq: int, boot_id: int | None = None, *, repeat: bool = False) -> None:
         self.acked.append(seq)
+        if repeat:
+            self.repeated.append(seq)
 
     def stop(self, timeout: float = 3.0) -> None:
         pass
