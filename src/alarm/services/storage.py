@@ -36,6 +36,14 @@ CREATE TABLE IF NOT EXISTS log_entries (
     detail TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_log_entries_ts ON log_entries(ts);
+-- Estado operativo que debe sobrevivir al reinicio (armada/desarmada y su
+-- marca de tiempo). Es una tabla clave-valor para no cambiar el esquema cada
+-- vez que haga falta recordar un dato suelto.
+CREATE TABLE IF NOT EXISTS system_state (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 # Cabeceras del CSV. Se mantienen en espanol porque el fichero es para leerlo,
@@ -256,6 +264,32 @@ class EventStore:
             with suppress(sqlite3.Error):
                 self.purge()
         return row
+
+    # -- Estado del sistema ------------------------------------------------
+
+    def get_state(self, key: str, default: str | None = None) -> str | None:
+        """Valor guardado para ``key``, o ``default`` si no existe."""
+        with self._lock:
+            row = self._con.execute(
+                "SELECT value FROM system_state WHERE key = ?", (key,)
+            ).fetchone()
+        return default if row is None else str(row[0])
+
+    def set_state(self, key: str, value: str) -> None:
+        """Guarda un valor que debe sobrevivir al reinicio (upsert)."""
+        with self._lock:
+            self._con.execute(
+                "INSERT INTO system_state (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                "updated_at=excluded.updated_at",
+                (key, value, self._clock()),
+            )
+            self._con.commit()
+
+    def clear_state(self, key: str) -> None:
+        with self._lock:
+            self._con.execute("DELETE FROM system_state WHERE key = ?", (key,))
+            self._con.commit()
 
     # -- Lectura -----------------------------------------------------------
 

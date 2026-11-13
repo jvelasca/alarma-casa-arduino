@@ -138,6 +138,8 @@ class SerialConfig:
     que el usuario pulse nada. ``heartbeat_timeout_s`` es cuantos segundos sin
     recibir una linea se toleran antes de dar el enlace por perdido; el
     firmware late cada 2 s, asi que 8 s son cuatro latidos perdidos.
+    ``handshake_timeout_s`` es el plazo para el primer ``hello`` tras abrir el
+    puerto: si no llega, el puerto no era la placa y se prueba el siguiente.
     """
 
     port: str = "auto"
@@ -145,11 +147,18 @@ class SerialConfig:
     auto_connect: bool = True
     reconnect_max_s: float = 30.0
     heartbeat_timeout_s: float = 8.0
+    handshake_timeout_s: float = 3.0
 
 
 @dataclass(frozen=True, slots=True)
 class AlarmRulesConfig:
     armed_on_start: bool = False
+    # El estado de armado se guarda en SQLite y se recupera al arrancar. Es
+    # distinto de `armed_on_start`: este es la politica de arranque (solo se
+    # usa si no hay estado guardado); aquel es lo que de verdad quedo activo.
+    # Ponerlo a false vuelve al comportamiento antiguo: arrancar segun
+    # `armed_on_start` ignorando lo guardado.
+    restore_state_on_start: bool = True
     cooldown_s: int = 180
     max_per_hour: int = 6
     # Retardos de una alarma profesional. 0 los desactiva: armar vigila al
@@ -420,6 +429,12 @@ class NtfyConfig:
         return value if value in NTFY_PRIORITY_LEVELS else "default"
 
 
+#: Ordenes puramente informativas. No cambian el estado ni revelan la situacion
+#: de la casa, asi que no se pueden desactivar ni exigen credencial: la ayuda
+#: tiene que estar disponible justo cuando algo va mal y la clave no se recuerda.
+PUBLIC_ACTIONS: frozenset[str] = frozenset({"help"})
+
+
 @dataclass(frozen=True, slots=True)
 class RemoteConfig:
     """Mando remoto: el PC escucha ordenes publicadas en un tema de ntfy.
@@ -473,7 +488,11 @@ class RemoteConfig:
 
     @property
     def allows(self) -> tuple[str, ...]:
-        """Ordenes que acepta esta configuracion, con sus nombres internos."""
+        """Ordenes configurables que acepta esta configuracion, con sus nombres internos.
+
+        No incluye `help`: esa orden no se puede apagar y no forma parte de lo
+        que el usuario activa o desactiva en el dialogo del mando.
+        """
         pairs = (
             ("arm", self.allow_arm),
             ("disarm", self.allow_disarm),
@@ -484,7 +503,12 @@ class RemoteConfig:
         return tuple(name for name, allowed in pairs if allowed)
 
     def allows_action(self, action: str) -> bool:
-        return action in self.allows
+        """Si la orden se puede ejecutar con esta configuracion.
+
+        La ayuda es informativa: se responde siempre, aunque el resto de
+        ordenes este desactivado.
+        """
+        return action in PUBLIC_ACTIONS or action in self.allows
 
 
 @dataclass(frozen=True, slots=True)
@@ -784,10 +808,12 @@ def from_mapping(data: Mapping[str, Any]) -> AppConfig:
         auto_connect=_bool(serial_raw, "auto_connect", True, "serial"),
         reconnect_max_s=_float(serial_raw, "reconnect_max_s", 30.0, "serial", 1.0, 600.0),
         heartbeat_timeout_s=_float(serial_raw, "heartbeat_timeout_s", 8.0, "serial", 2.0, 300.0),
+        handshake_timeout_s=_float(serial_raw, "handshake_timeout_s", 3.0, "serial", 1.0, 30.0),
     )
 
     rules = AlarmRulesConfig(
         armed_on_start=_bool(alarm_raw, "armed_on_start", False, "alarm"),
+        restore_state_on_start=_bool(alarm_raw, "restore_state_on_start", True, "alarm"),
         cooldown_s=_int(alarm_raw, "cooldown_s", 180, "alarm", 0, 86400),
         max_per_hour=_int(alarm_raw, "max_per_hour", 6, "alarm", 1, 1000),
         exit_delay_s=_int(alarm_raw, "exit_delay_s", 45, "alarm", 0, 300),

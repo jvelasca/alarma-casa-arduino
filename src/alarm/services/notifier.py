@@ -47,6 +47,10 @@ class Notifier:
         self._queue: queue.Queue[Notification] = queue.Queue(maxsize=max(1, max_queue))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # Serializa comprobar hueco, gastar cuota y encolar. Sin el, dos avisos
+        # simultaneos podrian ver libre la ultima plaza y uno consumiria su
+        # cuota para acabar descartado.
+        self._submit_lock = threading.Lock()
 
         self.sent = 0
         self.failed = 0
@@ -87,25 +91,36 @@ class Notifier:
     # -- API ---------------------------------------------------------------
 
     def submit(self, cause: str, subject: str, body: str, *, ignore_gate: bool = False) -> bool:
-        """Encola un aviso. Devuelve False si no hay canal o si se bloqueo.
+        """Encola un aviso. Devuelve False si no hay canal, no cabe o se bloqueo.
 
         `ignore_gate` se usa para las pruebas manuales del dialogo: el usuario
         pide el envio, asi que ni el enfriamiento ni el tope horario aplican.
+
+        El orden importa. La compuerta **consume** la cuota de esa causa al
+        decir que si, asi que solo se llama cuando el aviso va a entrar de
+        verdad: si la cola esta llena se descarta sin gastar el enfriamiento,
+        porque el siguiente aviso de la misma causa debe poder salir.
         """
         if not self.channels_for(cause):
             return False
-        if not ignore_gate and not self._gate(cause):
-            self.blocked += 1
-            log.info("aviso '%s' bloqueado por enfriamiento o limite horario", cause)
-            return False
 
-        self._ensure_thread()
-        try:
-            self._queue.put_nowait(Notification(cause, subject, body))
-        except queue.Full:
-            self.dropped += 1
-            log.warning("cola de avisos llena: se descarta '%s'", cause)
-            return False
+        with self._submit_lock:
+            if self._queue.full():
+                self.dropped += 1
+                log.warning("cola de avisos llena: se descarta '%s' sin gastar cuota", cause)
+                return False
+            if not ignore_gate and not self._gate(cause):
+                self.blocked += 1
+                log.info("aviso '%s' bloqueado por enfriamiento o limite horario", cause)
+                return False
+
+            self._ensure_thread()
+            try:
+                self._queue.put_nowait(Notification(cause, subject, body))
+            except queue.Full:  # pragma: no cover - el cerrojo lo hace imposible
+                self.dropped += 1
+                log.warning("cola de avisos llena: se descarta '%s'", cause)
+                return False
         return True
 
     def close(self) -> None:

@@ -726,9 +726,11 @@ baudrate = 115200
 auto_connect = true         # conectar sola al arrancar y mantener el enlace
 reconnect_max_s = 30        # espera máxima entre reintentos (retroceso exponencial)
 heartbeat_timeout_s = 8     # sin datos durante 8 s: enlace perdido (4 latidos)
+handshake_timeout_s = 3     # sin `hello` tras abrir: ese puerto no era la placa
 
 [alarm]
 armed_on_start = false
+restore_state_on_start = true  # recupera el armado/desarmado previo de SQLite
 cooldown_s = 180        # mínimo entre avisos de la misma causa
 max_per_hour = 6        # tope de avisos por hora
 

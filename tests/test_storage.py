@@ -166,6 +166,42 @@ def test_cerrar_dos_veces_no_falla(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Estado del sistema (armado persistente y marcas de tiempo)
+# ---------------------------------------------------------------------------
+
+
+def test_el_estado_guardado_sobrevive_a_reabrir(tmp_path: Path) -> None:
+    path = tmp_path / "alarm.db"
+    store = _abrir(path)
+    try:
+        assert store.get_state("armed_intent") is None
+        assert store.get_state("armed_intent", "false") == "false"
+        store.set_state("armed_intent", "true")
+        store.set_state("armed_at", "1700000000")
+    finally:
+        store.close()
+
+    reabierto = _abrir(path)
+    try:
+        assert reabierto.get_state("armed_intent") == "true"
+        assert reabierto.get_state("armed_at") == "1700000000"
+    finally:
+        reabierto.close()
+
+
+def test_set_state_actualiza_en_sitio(tmp_path: Path) -> None:
+    store = _abrir(tmp_path / "alarm.db")
+    try:
+        store.set_state("armed_intent", "true")
+        store.set_state("armed_intent", "false")
+        assert store.get_state("armed_intent") == "false"
+        store.clear_state("armed_intent")
+        assert store.get_state("armed_intent") is None
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------------
 # Consulta de solo lectura (la que usa `alarmctl log`)
 # ---------------------------------------------------------------------------
 

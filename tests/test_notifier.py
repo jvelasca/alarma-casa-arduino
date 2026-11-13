@@ -110,6 +110,121 @@ def test_cola_llena_descarta_sin_bloquear() -> None:
         notifier.close()
 
 
+def test_la_cola_llena_no_gasta_la_cuota_de_la_causa() -> None:
+    """Descartar por falta de sitio no puede bloquear el siguiente aviso.
+
+    La compuerta consume el enfriamiento cuando dice que si; si se llamara
+    antes de saber si el aviso cabe, un descarte dejaria la causa bloqueada
+    sin haber enviado nada.
+    """
+    calls: list[str] = []
+
+    def gate(cause: str) -> bool:
+        calls.append(cause)
+        return True
+
+    channel = FakeChannel()
+    channel.release = threading.Event()
+    notifier = Notifier([channel], gate=gate, max_queue=1)
+    try:
+        assert notifier.submit("triggered", "uno", "x") is True
+        assert _wait(lambda: channel.calls == 1)  # el trabajador esta ocupado
+        assert notifier.submit("triggered", "dos", "x") is True  # ocupa la cola
+        assert calls == ["triggered", "triggered"]
+
+        assert notifier.submit("triggered", "tres", "x") is False
+        assert notifier.dropped == 1
+        assert notifier.blocked == 0
+        assert calls == ["triggered", "triggered"], "un descarte no consume cuota"
+
+        # Al drenar, el mismo aviso se acepta: el enfriamiento sigue intacto.
+        assert channel.release is not None
+        channel.release.set()
+        assert _wait(lambda: notifier.sent >= 2)
+        assert notifier.submit("triggered", "cuatro", "x") is True
+        assert calls[-1] == "triggered"
+    finally:
+        assert channel.release is not None
+        channel.release.set()
+        notifier.close()
+
+
+def test_la_compuerta_denegada_no_ocupa_plaza_en_la_cola() -> None:
+    channel = FakeChannel()
+    channel.release = threading.Event()
+    notifier = Notifier([channel], gate=lambda _cause: False, max_queue=1)
+    try:
+        assert notifier.submit("triggered", "uno", "x") is False
+        assert notifier.blocked == 1
+        assert notifier.dropped == 0
+        # La plaza sigue libre para un aviso que si pase la compuerta.
+        assert notifier.submit("triggered", "dos", "x", ignore_gate=True) is True
+        assert _wait(lambda: channel.calls == 1)
+    finally:
+        assert channel.release is not None
+        channel.release.set()
+        notifier.close()
+
+
+def test_ignore_gate_con_la_cola_llena_no_toca_la_compuerta() -> None:
+    calls: list[str] = []
+
+    def gate(cause: str) -> bool:
+        calls.append(cause)
+        return False
+
+    channel = FakeChannel()
+    channel.release = threading.Event()
+    notifier = Notifier([channel], gate=gate, max_queue=1)
+    try:
+        assert notifier.submit("triggered", "uno", "x", ignore_gate=True) is True
+        assert _wait(lambda: channel.calls == 1)
+        assert notifier.submit("triggered", "dos", "x", ignore_gate=True) is True
+        assert notifier.submit("triggered", "tres", "x", ignore_gate=True) is False
+        assert notifier.dropped == 1
+        assert calls == [], "ignore_gate nunca consulta la compuerta"
+    finally:
+        assert channel.release is not None
+        channel.release.set()
+        notifier.close()
+
+
+def test_las_cuotas_gastadas_coinciden_con_los_avisos_aceptados() -> None:
+    """Dos hilos encolando a la vez no pueden gastar una cuota de mas."""
+    gate_calls = 0
+    lock = threading.Lock()
+
+    def gate(_cause: str) -> bool:
+        nonlocal gate_calls
+        with lock:
+            gate_calls += 1
+        return True
+
+    channel = FakeChannel()
+    notifier = Notifier([channel], gate=gate, max_queue=1)
+    results: list[bool] = []
+    results_lock = threading.Lock()
+    start = threading.Barrier(4)
+
+    def worker() -> None:
+        start.wait()
+        for _ in range(5):
+            outcome = notifier.submit("triggered", "x", "y")
+            with results_lock:
+                results.append(outcome)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert gate_calls == sum(1 for outcome in results if outcome)
+        assert notifier.dropped == sum(1 for outcome in results if not outcome)
+    finally:
+        notifier.close()
+
+
 def test_un_canal_que_falla_no_tumba_el_hilo() -> None:
     class Explosive(FakeChannel):
         def send(self, subject: str, body: str, *, cause: str = "") -> DeliveryResult:

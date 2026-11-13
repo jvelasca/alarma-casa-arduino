@@ -104,9 +104,11 @@ baudrate = 115200
 auto_connect = true      # conectar sola al arrancar y mantener el enlace
 reconnect_max_s = 30     # espera máxima entre reintentos (retroceso exponencial)
 heartbeat_timeout_s = 8  # sin datos durante 8 s: enlace perdido (4 latidos)
+handshake_timeout_s = 3  # sin `hello` tras abrir: ese puerto no era la placa
 
 [alarm]
-armed_on_start = false   # arrancar ya armada
+armed_on_start = false   # arrancar ya armada (solo si no hay estado guardado)
+restore_state_on_start = true  # recuperar el armado/desarmado de la ultima sesion
 cooldown_s = 180         # mínimo entre avisos de la misma causa
 max_per_hour = 6         # tope total de avisos por hora
 exit_delay_s = 45        # armar -> vigilar; pitidos acelerados (0 = sin retardo)
@@ -643,6 +645,12 @@ pero sin credencial válida tampoco recibe respuesta —no se confirma a un
 desconocido que el tema existe—, queda en el historial sin la clave y cuenta
 para el bloqueo.
 
+`ayuda` es la excepción: es la única orden que no exige clave ni TOTP, se
+responde aunque el resto esté desactivado y funciona incluso con el mando
+bloqueado. Solo lista las órdenes y un ejemplo, así que no revela el estado de
+la casa ni cambia nada; si pidiera credencial, un bloqueo dejaría al usuario sin
+la única orden que le explica cómo salir del problema.
+
 ### 7.4 Clave o TOTP
 
 - **Clave de mando** (`ALARM_REMOTE_KEY` en `.env`): se compara con
@@ -780,6 +788,13 @@ El aviso se emite **una sola vez** por caída: el refresco de 500 ms no repite
 correos. La reconexión sigue sola, con retroceso exponencial hasta
 `reconnect_max_s`; si la placa reaparece en otro `COMx`, se vuelve a detectar por
 VID/PID.
+
+Antes del primer `hello` hay un plazo propio, `serial.handshake_timeout_s`
+(**3 s** por defecto): si el puerto abre pero la placa no saluda, ese puerto no
+era la placa. Se cierra, queda descartado dos minutos y se prueba el siguiente
+candidato de la autodetección, en vez de esperar indefinidamente en un
+adaptador USB ajeno. Un `COM` fijado a mano no se sustituye: se reintenta el
+mismo, porque puede ser una placa con un VID/PID no reconocido.
 
 ### 8.3 Al recuperar
 
