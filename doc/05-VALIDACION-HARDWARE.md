@@ -126,9 +126,9 @@ sitios. Que `arduino-cli` no esté en el `PATH` no impide compilar.
 | Configuración cargada | — (sin ventana abierta: la sesión se hizo con `alarmctl` y `serial_watch`) |
 | Jumper del HC-SR501 y ajuste | — (no se ajustó ni se comprobó en esta sesión; se anota al probar el sensor) |
 
-La placa llegó a esta sesión con el sketch ya subido por `flash.ps1`
-(16 048 B de flash, 1 022 B de RAM). Los `hello` capturados muestran
-`boot_id` 3 y 4: el contador sube en cada reinicio por DTR.
+En esta sesión se subió el sketch con `flash.ps1` (16 048 B de flash, 1 022 B de
+RAM) y los `hello` capturados muestran `boot_id` 3 y 4: el contador sube en cada
+reinicio por DTR.
 
 ## 4. Protocolo de evidencia
 
