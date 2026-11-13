@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alarm-casa"
+version = "0.1.0"
+description = "Alarma de presencia con Arduino Mega 2560 y HC-SR501"
+requires-python = ">=3.11"
+dependencies = [
+    "pyserial>=3.5",
+    # Se limita a la serie 6.7 a proposito: los stubs de PyQt6 6.8+ usan una
+    # sintaxis que mypy no acepta (`/` despues de `*`), y el proyecto comprueba
+    # los tipos en CI. Subir el limite cuando los stubs se corrijan.
+    "PyQt6>=6.7,<6.8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    # Solo se necesita para `scripts/build.ps1` (el .exe de un solo fichero).
+    "pyinstaller>=6.6",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tools", "tests", "packaging"]
+extend-exclude = ["doc", ".venv", "data", "firmware"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# Los trazados SVG son cadenas largas por naturaleza: partirlas las haria
+# ilegibles y el limite de linea no aporta nada aqui.
+"src/alarm/ui/icons.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = false
+files = ["src"]
+
+[[tool.mypy.overrides]]
+# pyserial no publica tipos; se declara como modulo sin stubs.
+module = "serial.*"
+ignore_missing_imports = true

@@ -1,0 +1,35 @@
+# Entorno y artefactos
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Datos locales: base de datos, capturas serie, exportaciones
+data/
+
+# Secretos y configuracion personal
+# Se versionan los ejemplos (.env.example, config/alarm.example.toml), no los
+# ficheros reales: pueden contener credenciales o correos personales.
+.env
+config/alarm.toml
+config/alarm.local.toml
+config/alarm.yaml
+config/*.local.yaml
+
+# Firmware
+firmware/*/build/
+
+# IDE / sistema
+# .vscode se versiona: launch.json es lo que hace que F5 arranque la app.
+.vscode/*
+!.vscode/launch.json
+!.vscode/settings.json
+!.vscode/tasks.json
+.idea/
+Thumbs.db
+desktop.ini

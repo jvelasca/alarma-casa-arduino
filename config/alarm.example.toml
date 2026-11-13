@@ -1,0 +1,261 @@
+# Configuracion de la alarma de presencia.
+#
+# Copia este fichero a `config/alarm.toml` (la aplicacion lo hace sola la
+# primera vez) y ajusta los valores. Las credenciales NO van aqui: viven en
+# `.env`, junto a este directorio pero un nivel arriba.
+#
+# Lo que guardes desde la ventana no modifica este fichero: se escribe en
+# `config/alarm.local.toml`, que se superpone a este. Asi no se pierden los
+# comentarios.
+#
+# Precedencia: valores por defecto < este fichero < alarm.local.toml < entorno.
+
+[serial]
+# "auto" busca una placa Arduino por VID/PID; tambien admite "COM5".
+port = "auto"
+baudrate = 115200
+# Conectar sola al arrancar y mantener el enlace: si la placa reaparece en otro
+# puerto USB, se vuelve a detectar por VID/PID.
+auto_connect = true
+# Espera maxima entre reintentos (segundos). El retroceso es exponencial hasta
+# este tope: la placa puede tardar en enumerar tras un corte de USB.
+reconnect_max_s = 30
+# Segundos sin recibir una linea antes de dar el enlace por perdido. El
+# firmware late cada 2 s: 8 s son cuatro latidos perdidos.
+heartbeat_timeout_s = 8
+
+[alarm]
+# Si es true, la alarma queda armada al arrancar la aplicacion.
+armed_on_start = false
+# Minimo entre dos avisos de la misma causa.
+cooldown_s = 180
+# Tope de avisos por hora, para no inundar el movil.
+max_per_hour = 6
+# Retardo de salida: segundos entre armar y que el PIR vigile. La placa pita
+# cada vez mas rapido durante la cuenta atras. 0 lo desactiva (vigila al
+# instante), que en la practica hace la alarma incomoda de usar.
+exit_delay_s = 45
+# Retardo de entrada: segundos entre detectar movimiento y disparar la alarma.
+# Es el tiempo para llegar al teclado y desarmar. 0 dispara al instante.
+entry_delay_s = 30
+# Rearme automatico tras un disparo: al terminar la sirena la alarma espera
+# rearm_delay_s y vuelve a vigilar sola, hasta max_rearms veces. false lo
+# desactiva: tras el disparo hay que desarmar o rearmar a mano.
+auto_rearm = false
+# Espera antes de rearmar, en segundos. Cuenta desde que termina la sirena.
+rearm_delay_s = 300
+# Tope de rearmes automaticos. Al agotarlo la alarma queda DISPARADA hasta
+# que alguien la desarme; es la red que evita una sirena en bucle.
+max_rearms = 3
+
+[tts]
+# Voz por el altavoz del PC. Usa SAPI de Windows: no requiere dependencias.
+enabled = true
+# Nombre exacto de la voz instalada. Vacio = voz predeterminada del sistema.
+# Se puede elegir desde Herramientas -> Configuracion de voces.
+voice = "Microsoft Helena Desktop"
+# -10 (lento) .. +10 (rapido)
+rate = 0
+# 0 .. 100
+volume = 90
+# Repeticiones por defecto de los mensajes que no fijen las suyas.
+repeat = 2
+
+# Cada aviso hablado se configura por separado:
+#   enabled  -> si se pronuncia
+#   text     -> lo que se dice; admite {hora}, {evento}, {zona} y {duracion}
+#   label    -> texto grande de estado en la ventana principal
+#   repeat   -> repeticiones de este mensaje (0 = no se dice)
+#   gap_ms   -> pausa entre una repeticion y la siguiente, en milisegundos
+#   delay_ms -> retardo antes de empezar a hablar, en milisegundos
+#   log      -> deja una fila «Voz» en el registro
+[tts.events.armed]
+enabled = true
+text = "Alarma armada."
+label = "ARMADA"
+repeat = 2
+gap_ms = 0
+delay_ms = 0
+log = true
+
+[tts.events.disarmed]
+enabled = true
+text = "Alarma desarmada."
+label = "DESARMADA"
+repeat = 2
+gap_ms = 0
+delay_ms = 0
+log = true
+
+[tts.events.triggered]
+enabled = true
+text = "Atencion. Se ha detectado una presencia a las {hora}."
+label = "DISPARADA"
+repeat = 2
+gap_ms = 0
+delay_ms = 0
+log = true
+
+# Al rearmarse sola tras un disparo. {n} es el rearme y {max} el tope.
+[tts.events.rearmed]
+enabled = true
+text = "Atención. La alarma se ha rearmado tras un disparo. Rearme {n} de {max}. Sigue vigilando."
+label = "REARMADA"
+repeat = 1
+gap_ms = 0
+delay_ms = 0
+log = true
+
+[tts.events.device_lost]
+enabled = true
+text = "Atención. El Arduino se ha desconectado: la alarma no está disponible."
+label = "SIN SENSOR"
+repeat = 2
+gap_ms = 0
+delay_ms = 0
+log = true
+
+[tts.events.device_ready]
+enabled = false
+text = "Sensor operativo."
+label = "OPERATIVO"
+repeat = 1
+gap_ms = 0
+delay_ms = 0
+log = true
+
+[notify.email]
+enabled = true
+# Que eventos generan correo. El disparo de la alarma siempre conviene.
+on_armed = true
+on_disarmed = false
+on_triggered = true
+# Avisa tambien cuando se pierde el enlace con la placa.
+on_device_lost = true
+
+host = "smtp.gmail.com"
+port = 587
+# starttls (587) | ssl (465) | none
+security = "starttls"
+from = "alarma@example.com"
+to = ["yo@example.com"]
+subject = "[Alarma] {evento} a las {hora}"
+timeout_s = 15
+retries = 2
+# Las credenciales se leen de .env:
+#   ALARM_SMTP_USER=cuenta@gmail.com
+#   ALARM_SMTP_PASSWORD=contrasena-de-aplicacion
+
+[notify.sms]
+# Avisos por SMS. Dos proveedores posibles:
+#   twilio        -> API HTTP. Requiere cuenta, saldo y ALARM_TWILIO_SID /
+#                    ALARM_TWILIO_TOKEN en .env. Es el unico fiable.
+#   email_gateway -> correo a <numero>@<dominio> del operador. Gratuito, pero
+#                    la mayoria de operadores espanoles han retirado la
+#                    pasarela; comprueba que la tuya sigue viva.
+enabled = false
+provider = "twilio"
+on_armed = false
+on_disarmed = false
+on_triggered = true
+# Avisa tambien cuando se pierde el enlace con la placa.
+on_device_lost = true
+to = ["+34600000000"]
+# Remitente de Twilio (numero comprado o alfanumerico verificado).
+from_number = ""
+# Solo para email_gateway: dominio de la pasarela del operador.
+gateway_domain = ""
+# Los SMS tienen 160 caracteres por segmento: el mensaje se recorta.
+template = "[Alarma] {evento} a las {hora}"
+timeout_s = 10
+retries = 1
+
+[notify.ntfy]
+# Avisos push gratuitos al movil con la aplicacion ntfy (Android e iPhone).
+# No usa SMS ni tarjeta SIM: el programa publica en un tema y la app suscrita
+# lo muestra. Instala la app, genera un tema y suscribete a el.
+enabled = false
+# Servidor publico o instancia propia (https://ntfy.tudominio.com).
+server = "https://ntfy.sh"
+# Nombre del tema: 1-64 caracteres de [A-Za-z0-9_-]. En ntfy.sh el tema no es
+# privado, asi que debe ser largo y aleatorio. Dejalo vacio y usa el boton
+# «Generar tema seguro» del dialogo de avisos.
+topic = ""
+on_armed = false
+on_disarmed = false
+on_triggered = true
+on_device_lost = true
+title = "[Alarma] {evento}"
+# min | low | default | high | urgent. «urgent» hace sonar el movil aunque
+# este en silencio: reservalo para el disparo.
+priority_triggered = "urgent"
+priority_device_lost = "high"
+priority_armed = "default"
+priority_disarmed = "default"
+timeout_s = 10
+retries = 1
+# Si usas un servidor propio con control de acceso, el token va en .env como
+# ALARM_NTFY_TOKEN, nunca aqui.
+
+[remote]
+# Mando remoto: el PC escucha ordenes publicadas desde el movil y responde.
+# Necesita el aviso al movil (arriba) activo y configurado. Las ordenes no
+# llegan con el PC apagado, y las anteriores al arranque se ignoran.
+enabled = false
+# Vacio: se usa "<tema de avisos>-mando". Debe caber en 64 caracteres.
+topic = ""
+allow_arm = true
+allow_disarm = true
+allow_status = true
+allow_silence = true
+# Hace sonar la sirena al instante. Desactivado a proposito: es facil pulsarlo
+# sin querer y despertar a la casa entera.
+allow_panic = false
+# Responder al movil con el resultado de cada orden, en el tema de avisos.
+reply = true
+# Intentos fallidos antes de ignorar ordenes (0 = sin bloqueo) y minutos que
+# dura el bloqueo. Se reinicia al cerrar y abrir la aplicacion.
+lockout_failures = 5
+lockout_minutes = 15
+# La clave va en .env como ALARM_REMOTE_KEY y el secreto TOTP como
+# ALARM_REMOTE_TOTP, nunca en este fichero.
+
+[ui]
+# Anade al registro una linea por cada latido. En uso normal es ruido; se
+# cambia desde Ver -> Mostrar latidos y se guarda en alarm.local.toml.
+show_heartbeats = false
+# Pitidos que guian las fases del ajuste del sensor (Ver -> Pitidos al ajustar).
+beeps = true
+
+[ui.labels]
+# Texto grande de estado en la ventana principal. Se puede cambiar desde
+# Herramientas -> Configuracion de voces, en la columna «Etiqueta».
+disarmed = "DESARMADA"
+armed = "ARMADA"
+triggered = "DISPARADA"
+silenced = "SILENCIADA"
+
+[buzzer]
+# Zumbador pasivo en la placa. Solo senaliza; no sustituye a una sirena.
+enabled = true
+# Pin informativo: el real lo fija PIN_BUZZER en el firmware y la app no lo
+# envia. En el montaje actual es D11, con el piezo puenteado a GND.
+pin = 11
+# Cuanto pita la placa al dispararse la alarma, en milisegundos. Dos minutos
+# por defecto; el tope es 600000 (10 min). Solo es la sirena del piezo: la voz,
+# el correo y el SMS no dependen de este valor.
+siren_ms = 120000
+# Tono continuo del dialogo «Zumbador»: frecuencia (100..8000 Hz) y duracion.
+# Los piezo baratos resuenan entre 2 y 4 kHz; fuera de esa banda suenan flojo.
+test_hz = 2000
+test_ms = 1200
+
+[log]
+# Historial de eventos en SQLite. Dos limites que se aplican a la vez:
+# se borra lo que incumpla cualquiera de los dos.
+max_events = 100000
+max_age_days = 365
+# Filas que se muestran en la ventana al arrancar. El CSV exporta todo.
+visible_rows = 1000
+# Relativo a la raiz del proyecto. La carpeta `data/` esta ignorada por git.
+db_path = "data/alarm.db"

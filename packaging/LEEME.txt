@@ -1,0 +1,181 @@
+ALARMA DE PRESENCIA - Arduino Mega 2560 + HC-SR501
+==================================================
+
+Contenido de esta carpeta
+-------------------------
+  AlarmaCasa.exe   La aplicacion completa en un solo fichero.
+  LEEME.txt        Este documento.
+
+No hace falta instalar Python ni ninguna otra cosa. Copia la carpeta entera al
+PC donde vaya a funcionar la alarma y abre AlarmaCasa.exe con doble clic.
+
+
+1. Primera puesta en marcha
+---------------------------
+Al abrirse por primera vez, el propio programa crea a su lado:
+
+  config\alarm.toml        ajustes con comentarios (se puede editar a mano)
+  config\alarm.local.toml  lo que cambies desde la ventana
+  data\alarm.db            historial de eventos (SQLite)
+
+Si la carpeta esta en una unidad de solo lectura (por ejemplo, un USB
+protegido), los datos van a %LOCALAPPDATA%\AlarmaCasa y la barra de estado lo
+indica.
+
+La placa se conecta sola al arrancar: busca el Arduino por el puerto serie y no
+hay que elegir nada. Si hay varios dispositivos, usa Archivo -> Conectar.
+
+
+2. Avisos disponibles
+---------------------
+  Voz por el altavoz     anuncios hablados en el PC
+  Correo (SMTP)          aviso por correo electronico
+  SMS (Twilio)           de pago, requiere cuenta y numero remitente
+  Movil (ntfy)           notificacion push gratuita, sin SMS ni tarjeta SIM
+  Mando remoto (ntfy)    ordenes desde el movil: armar, desarmar, consultar...
+  Zumbador de la placa   sirena y patrones de sonido
+
+Todos se configuran en Avisos -> Correo, SMS y movil..., y cada uno tiene su
+casilla en el menu Avisos y su indicador en la barra de estado inferior.
+
+
+3. Avisos push gratis al movil con ntfy
+----------------------------------------
+ntfy es una aplicacion gratuita y de codigo abierto que recibe notificaciones
+en el telefono. Funciona en Android (Google Play o F-Droid) y en iPhone (App
+Store). En el PC no hay que instalar nada mas: el programa ya lo lleva dentro.
+
+Paso 1. Instala la aplicacion ntfy en el movil.
+Paso 2. En el PC: Avisos -> Correo, SMS y movil... -> pestana "Movil (ntfy)".
+Paso 3. Pulsa "Generar tema seguro". Aparece un nombre largo y aleatorio, por
+        ejemplo: alarma-9fj2k_x7qp1a
+Paso 4. En la app del movil, pulsa "+" y suscribete a ese mismo tema
+        (servidor ntfy.sh si no has cambiado nada).
+Paso 5. Pulsa "Probar movil". La notificacion debe llegar en segundos, con el
+        telefono bloqueado y la app cerrada.
+Paso 6. Marca "Enviar avisos al movil (ntfy)" y guarda.
+
+Prioridades
+  El disparo de la alarma se envia como "urgent": suena aunque el movil este
+  en silencio. "Sin sensor" va como "high" y armar/desarmar como "normal".
+  Se ajustan en la misma pestana.
+
+Seguridad
+  En el servidor publico (ntfy.sh) un tema NO es privado: cualquiera que
+  conozca su nombre puede suscribirse y leerlo. Por eso el tema debe ser largo
+  y aleatorio, y por eso conviene no poner en el los datos de la casa.
+  Si quieres control de acceso real, monta tu propio servidor ntfy (por
+  ejemplo en una Raspberry Pi), crea un token y pegalo en el campo "Token" de
+  esa misma pestana: se guarda en .env, no en el TOML, y no aparece en los
+  registros.
+
+Sin Internet no hay notificacion
+  Si el PC o el movil se quedan sin conexion, el aviso no llega. El correo y el
+  SMS tampoco salen sin red; la sirena y la voz siguen funcionando.
+
+
+4. Mando remoto por ntfy
+------------------------
+La app del movil tambien puede dar ordenes al PC: armar, desarmar, consultar el
+estado y silenciar la sirena. Las ordenes van por un tema distinto del de los
+avisos, para que el PC no se conteste a si mismo.
+
+Paso 1. Avisos -> Mando remoto (ntfy)...
+Paso 2. Marca "Aceptar ordenes por ntfy".
+Paso 3. Pulsa "Generar clave" y copiala al movil (minimo 12 caracteres).
+Paso 4. En la app, suscribete al "tema de mando" que muestra el dialogo.
+Paso 5. En ese tema, publica un mensaje con la clave y la orden.
+Paso 6. Guarda. El indicador de llave se pone azul.
+
+Ejemplos de mensaje:
+
+  clave-7f3k9x armar
+  clave-7f3k9x consultar
+  clave-7f3k9x desarmar
+  clave-7f3k9x silenciar
+
+  armar clave-7f3k9x        (la clave tambien vale al final)
+
+Ordenes: armar (activar, arm), desarmar (apagar, disarm), consultar (estado,
+status), silenciar (callar, silencio), ayuda y panico (desactivado por
+defecto). Se ignoran mayusculas, acentos y puntuacion sobrante. Cada orden
+aceptada deja una fila "Mando remoto" en el historial y contesta en el tema de
+avisos con "[Mando] ...".
+
+Codigo TOTP en lugar de clave
+  En vez de una clave fija se puede activar un codigo de seis digitos de Google
+  Authenticator, Authy o similar: marca "Usar codigo TOTP", pulsa "Generar
+  secreto" y copia la URI otpauth:// en la app de autenticacion. Con TOTP
+  activo la clave deja de valer a proposito. El reloj del PC debe estar en
+  hora; si no, todos los codigos se rechazan.
+
+Bloqueo y seguridad
+  Tras cinco fallos, el mando se bloquea quince minutos y manda un solo aviso
+  "[Alarma] Mando bloqueado". Un mensaje sin la clave correcta no recibe
+  respuesta, para no confirmar a un desconocido que hay una alarma detras.
+  En ntfy.sh la clave viaja en el mensaje y quien lea el tema la ve; el codigo
+  TOTP caduca en 30 segundos. Para control de acceso real, servidor propio con
+  token y permisos por usuario (ntfy access).
+
+Limites
+  El PC tiene que estar encendido y la app abierta. Solo se ejecutan las
+  ordenes posteriores al arranque: un "desarmar" de ayer no se aplica hoy. Si
+  el PC estaba apagado cuando se envio, la orden se pierde.
+
+
+5. Copia de seguridad completa (contrasenas incluidas)
+------------------------------------------------------
+Archivo -> Guardar copia completa (con credenciales)...
+
+Genera un unico fichero .alarmbackup con toda la configuracion, el puerto
+serie, la contrasena de correo, el token de Twilio, el de ntfy, la clave de
+mando y el secreto TOTP. Ese fichero lleva secretos en claro: guardalo como
+guardarias una contrasena.
+
+En el PC nuevo:
+  1. Copia AlarmaCasa.exe (o esta carpeta entera) y abre el programa una vez.
+  2. Archivo -> Restaurar copia completa... y elige el fichero.
+  3. La ventana recarga la configuracion al momento, sin reiniciar.
+
+Desde la linea de comandos tambien existe, para quien tenga Python instalado:
+  python tools\alarmctl.py backup export --out copia.alarmbackup
+  python tools\alarmctl.py backup import --from copia.alarmbackup
+  python tools\alarmctl.py ntfy-test        (prueba del aviso al movil)
+
+
+6. Problemas frecuentes
+-----------------------
+No llega el aviso al movil
+  - Pulsa "Probar movil" en la pestana ntfy y lee el mensaje de error.
+  - Comprueba que el tema del PC y el de la app son identicos, caracter a
+    caracter (un guion bajo de mas basta para que no coincidan).
+  - Si usas un servidor propio con token, revisa que el token sigue vigente.
+  - En iPhone, revisa que las notificaciones de ntfy estan permitidas en
+    Ajustes -> ntfy -> Notificaciones.
+
+El indicador de la barra esta en ambar
+  El canal esta activo pero le faltan datos: servidor, tema, credenciales o
+  destinatarios. Abre Avisos -> Correo, SMS y movil... y mira que dice.
+
+El movil no consigue armar ni desarmar
+  - En Avisos -> Mando remoto (ntfy)... el panel "Estado en vivo" dice si esta
+    escuchando, si falta algo o el ultimo error de conexion.
+  - Comprueba que publicas en el TEMA DE MANDO, no en el de avisos, y que la
+    clave y la orden van en el mismo mensaje ("clave armar").
+  - Si dice "bloqueado", espera los minutos configurados o reinicia la
+    aplicacion: el bloqueo no se guarda entre arranques.
+  - Con TOTP, revisa la hora del PC: un desfase de mas de 30 segundos hace que
+    todos los codigos se rechacen.
+  - La orden anterior al arranque de la app no se ejecuta nunca.
+
+La ventana tarda unos segundos en abrirse
+  Es normal: el ejecutable se descomprime en una carpeta temporal cada vez que
+  arranca. La configuracion y el historial NO viven ahi, sino junto al .exe.
+
+
+7. Documentacion completa
+-------------------------
+En el repositorio del proyecto:
+  doc\03-AVISOS.md   voz, correo, SMS, ntfy, mando remoto, zumbador y limites
+  doc\04-INTERFAZ.md menus, dialogos e indicadores
+  README.md          puesta en marcha, cableado y uso diario

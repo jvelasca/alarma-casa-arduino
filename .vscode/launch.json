@@ -1,0 +1,90 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Alarma (hardware)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "alarm",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "Alarma (simulada)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "alarm",
+      "args": ["--sim", "--sim-speed", "4"],
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "Alarma (simulada, depuracion detallada)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "alarm",
+      "args": ["--sim", "--sim-speed", "4", "--log", "DEBUG"],
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "Consola: info",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/tools/alarmctl.py",
+      "args": ["info"],
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "Consola: ajuste del sensor",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/tools/alarmctl.py",
+      "args": ["calibrate", "--skip-warmup", "--beep"],
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src",
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "Pruebas (pytest)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["-v"],
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ]
+}

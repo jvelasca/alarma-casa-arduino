@@ -1,0 +1,202 @@
+"""Pruebas del contrato con el firmware real.
+
+El codec se prueba con lineas construidas a mano en `test_codec.py`, pero eso
+no detecta que el sketch emita JSON mal formado: el `hello` llevaba tiempo
+saliendo con `}],,` (una coma al final de un `print` y otra al principio del
+siguiente) y la aplicacion rechazaba el saludo de la placa de verdad. Aqui se
+fija la linea capturada del hardware y se revisa el emisor del sketch.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+
+import pytest
+
+from alarm.protocol.codec import MAX_LINE, decode_line
+from alarm.protocol.messages import Heartbeat, Hello, Ready
+
+FIRMWARE = Path(__file__).resolve().parents[1] / "firmware" / "mega-pir" / "mega-pir.ino"
+
+#: Linea tal cual la escupio un Mega 2560 por COM3 a 115200 baudios.
+HELLO_REAL = (
+    '{"t":"hello","proto":1,"dev":"mega-pir","fw":"1.4.1","boot":0,'
+    '"zones":[{"id":1,"pin":2,"name":"pir"}],'
+    '"caps":["hello","set","replay","calibrate","beep"],'
+    '"cfg":{"warmup_ms":60000,"debounce_ms":50,"hb_ms":2000,'
+    '"calib_window_ms":5000,"buzzer_pin":11,"buzzer":1,"armed":0}}'
+)
+
+#: Latido durante el calentamiento: llega cada 5 s y solo trae `warmup`.
+HB_REAL = '{"t":"hb","up":5000,"lvl":0,"raw":0,"buf":0,"lost":0,"calib":0,"warmup":1}'
+
+#: Latido normal, ya terminado el calentamiento.
+HB_REAL_LISTO = '{"t":"hb","up":65000,"lvl":0,"raw":3,"buf":0,"lost":0,"calib":0}'
+
+READY_REAL = '{"t":"ready","warmup_ms":60000}'
+
+
+def test_la_linea_hello_del_hardware_se_decodifica() -> None:
+    message = decode_line(HELLO_REAL)
+
+    assert isinstance(message, Hello)
+    assert message.dev == "mega-pir"
+    assert message.fw == "1.4.1"
+    assert [(zone.pin, zone.name) for zone in message.zones] == [(2, "pir")]
+    assert "beep" in message.caps
+    assert message.cfg["buzzer_pin"] == 11
+    assert message.cfg["warmup_ms"] == 60000
+
+
+def test_la_linea_cabe_en_el_limite_del_buffer() -> None:
+    assert len(HELLO_REAL) < MAX_LINE
+
+
+def test_los_latidos_reales_se_decodifican() -> None:
+    durante = decode_line(HB_REAL)
+    listo = decode_line(HB_REAL_LISTO)
+
+    assert isinstance(durante, Heartbeat)
+    assert isinstance(listo, Heartbeat)
+    assert durante.warming_up is True
+    assert durante.up_ms == 5000
+    assert listo.warming_up is False
+    assert listo.raw_edges == 3
+
+
+def test_el_ready_real_se_decodifica() -> None:
+    message = decode_line(READY_REAL)
+
+    assert isinstance(message, Ready)
+    assert message.warmup_ms == 60000
+
+
+# -- El emisor del sketch ---------------------------------------------------
+
+
+def _emit_body(name: str) -> str:
+    """Devuelve el cuerpo de `void emitAlgo(...)`, sin las llaves exteriores."""
+    source = FIRMWARE.read_text(encoding="utf-8")
+    match = re.search(rf"void {name}\([^)]*\) \{{(.*?)\n\}}", source, re.S)
+    assert match, f"no se encuentra la funcion {name} en el sketch"
+    return match.group(1)
+
+
+def _assembled_json(body: str) -> str:
+    """Reconstruye lo que el sketch imprime, con `0` donde va un valor.
+
+    Cada `Serial.print(F("..."))` aporta su literal y cada `Serial.print(x)`
+    con una variable aporta un cero. Asi las comas de dos literales que se
+    imprimen seguidos quedan juntas y se ven, que es justo el fallo.
+    """
+    pieces: list[str] = []
+    for match in re.finditer(r"Serial\.print(?:ln)?\((.*?)\);", body, re.S):
+        argument = match.group(1).strip()
+        literal = re.fullmatch(r'F\("((?:[^"\\]|\\.)*)"\)', argument, re.S)
+        if literal is None:
+            pieces.append("0")
+            continue
+        pieces.append(literal.group(1).replace('\\"', '"').replace("\\n", "\n"))
+    return "".join(pieces)
+
+
+def test_el_hello_del_sketch_es_json_valido() -> None:
+    """Regresion del `}],,` que hacia ilegible el saludo de la placa."""
+    text = _assembled_json(_emit_body("emitHello"))
+
+    assert ",," not in text, f"coma doble en el hello del sketch: {text}"
+    data = json.loads(text)
+    assert data["t"] == "hello"
+    assert data["proto"] == 1
+    assert data["cfg"].keys() >= {"warmup_ms", "buzzer_pin", "buzzer", "armed"}
+    assert data["zones"] == [{"id": 1, "pin": 0, "name": "pir"}]
+
+
+def test_el_pin_del_zumbador_del_sketch_coincide_con_la_configuracion() -> None:
+    """El TOML es informativo, asi que ambos tienen que decir lo mismo."""
+    from alarm.config import default_config
+
+    source = FIRMWARE.read_text(encoding="utf-8")
+    match = re.search(r"const uint8_t PIN_BUZZER = (\d+);", source)
+    assert match, "no se encuentra PIN_BUZZER en el sketch"
+    pin = int(match.group(1))
+
+    assert pin == default_config().buzzer.pin, (
+        f"el firmware usa D{pin} y la configuración dice {default_config().buzzer.pin}"
+    )
+
+
+@pytest.mark.parametrize("name", ["emitHeartbeat", "emitEvent", "emitCalibEdge"])
+def test_los_demas_emisores_no_llevan_comas_dobles(name: str) -> None:
+    text = _assembled_json(_emit_body(name))
+
+    assert ",," not in text, f"coma doble en {name}: {text}"
+
+
+def test_el_sketch_entiende_los_patrones_que_ofrece_la_ventana() -> None:
+    """La ventana del zumbador no debe ofrecer nombres que la placa ignore."""
+    from alarm.ui.dialogs.buzzer import PATTERNS
+
+    source = FIRMWARE.read_text(encoding="utf-8")
+    match = re.search(r"bool beeperByName\([^)]*\) \{(.*?)\n\}", source, re.S)
+    assert match, "no se encuentra beeperByName en el sketch"
+    body = match.group(1)
+
+    for name, title, _hint in PATTERNS:
+        assert f'"{name}"' in body, f"la ventana ofrece «{title}» y el sketch no lo conoce"
+
+
+def test_el_pitido_de_prueba_puede_forzar_el_calentamiento() -> None:
+    """Regresion: con el PIR calentando, «Probar zumbador» no sonaba.
+
+    El firmware solo pitaba con `g_warmupDone`, asi que recien conectada la
+    placa cualquier prueba era silencio y parecia un cableado mal puesto.
+    """
+    source = FIRMWARE.read_text(encoding="utf-8")
+
+    assert 'strcmp(kv, "force")' in source, "el comando beep debe aceptar force=1"
+    assert 'strcmp(kv, "freq")' in source, "el tono continuo necesita frec=Hz"
+    assert "(!g_warmupDone && !force)" in source, "la puerta del calentamiento debe respetar force"
+
+    calls = re.findall(r"beeperStart\(([^\n]*)\);", source)
+    assert calls, "no se encuentran llamadas a beeperStart"
+    for args in calls:
+        assert args.count(",") == 4, f"a beeperStart({args}) le falta el permiso `force`"
+
+
+def test_el_tono_continuo_se_apaga_solo() -> None:
+    """Un tono sin final dejaria el piezo sonando hasta desenchufar."""
+    source = FIRMWARE.read_text(encoding="utf-8")
+    match = re.search(r"void beeperTick\(uint32_t now\) \{(.*?)\n\}", source, re.S)
+    assert match, "no se encuentra beeperTick en el sketch"
+
+    assert "g_toneActive" in match.group(1), "beeperTick debe vencer el tono continuo"
+
+
+def test_el_sketch_genera_las_cadencias_de_los_retardos() -> None:
+    """Los retardos pitan en la placa, no a golpe de comando desde el PC."""
+    source = FIRMWARE.read_text(encoding="utf-8")
+
+    assert re.search(r"void countdownTick\(uint32_t now\)", source), "falta la cuenta atras"
+    tick = re.search(r"void beeperTick\(uint32_t now\) \{(.*?)\n\}", source, re.S)
+    assert tick and "countdownTick(now)" in tick.group(1)
+
+    # La cadencia se acelera: el intervalo baja del valor inicial al final.
+    assert "g_cdFromMs - (uint16_t)" in source
+    assert "span * done / g_cdTotalMs" in source
+
+    names = re.search(r"bool beeperByName\([^)]*\) \{(.*?)\n\}", source, re.S)
+    assert names, "no se encuentra beeperByName"
+    for name in ("exit", "entry", "stop"):
+        assert f'"{name}"' in names.group(1), f"el sketch no entiende el aviso {name!r}"
+
+    # La parada corta tambien la cuenta atras, no solo los patrones.
+    stop = re.search(r"void beeperStop\(\) \{(.*?)\n\}", source, re.S)
+    assert stop and "g_cdActive" in stop.group(1)
+
+    # Un patron explicito manda sobre la cadencia en curso: el PC acaba de
+    # pedir otra cosa y dejar el reloj viejo pitando seria contradecirlo.
+    assert "g_cdActive = false" in names.group(1)
+    assert 'strcmp(name, "exit") != 0' in names.group(1)

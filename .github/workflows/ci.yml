@@ -1,0 +1,56 @@
+name: CI
+
+# Se ejecuta en cada push a main y en cada pull request. Lo que se comprueba es
+# exactamente lo mismo que se puede repetir en local (ver «Calidad» del README):
+# estilo, tipos y pruebas. Windows porque la aplicacion es de escritorio Windows,
+# usa rutas y serial, y las pruebas levantan Qt en modo offscreen.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  calidad:
+    name: Calidad (Python ${{ matrix.python }})
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Instalar el paquete y las herramientas
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Ruff (estilo)
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: mypy (tipos)
+        run: mypy
+
+      - name: pytest
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest --tb=short

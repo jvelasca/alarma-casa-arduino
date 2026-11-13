@@ -1,0 +1,19 @@
+# Control de finales de línea y binarios
+#
+# El proyecto se escribe en Windows, pero se lee y se audita también desde Linux
+# y macOS. Los ficheros de texto se guardan con LF dentro del repositorio (así el
+# diff no muestra líneas cambiadas por el salto) y se convierten al saltar del
+# sistema al hacer checkout. Los scripts de PowerShell se quedan en CRLF porque
+# algunas herramientas de Windows los ejecutan tal cual.
+
+* text=auto eol=lf
+
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.png binary
+*.jpg binary
+*.wav binary
+*.exe binary
+*.db binary
