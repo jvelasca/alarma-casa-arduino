@@ -67,13 +67,6 @@ def mono(size: int = 9) -> QFont:
     return QFont(MONO_FAMILY, size)
 
 
-def hero_font() -> QFont:
-    f = QFont(FONT_FAMILY, 30)
-    f.setBold(True)
-    f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2.0)
-    return f
-
-
 def state_color(key: str, *, silenced: bool = False) -> str:
     """Color del estado de la alarma. Coincide con el semaforo esperado."""
     if key == "armed":

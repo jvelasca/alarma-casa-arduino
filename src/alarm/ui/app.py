@@ -22,7 +22,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import QSize, Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QAction, QCloseEvent, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication,
@@ -40,7 +40,6 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QStatusBar,
-    QToolBar,
     QVBoxLayout,
     QWidget,
 )
@@ -128,7 +127,7 @@ from .dialogs.remote import RemoteDialog
 from .dialogs.result import ResultDialog
 from .dialogs.voice_config import VoiceConfigDialog
 from .sensor_panel import SensorPanel
-from .widgets import Card, EventLog, IconButton, StateHero, tip
+from .widgets import AdaptiveToolBar, Card, EventLog, IconButton, StateHero, tip
 
 log = logging.getLogger(__name__)
 
@@ -478,6 +477,10 @@ class MainWindow(QMainWindow):
         action = QAction(text, self)
         if icon_name:
             action.setIcon(icons.icon(icon_name, color, 22))
+            # La barra redibuja los iconos al tamano que quepa: guarda de que
+            # icono se trata y con que color, porque el `QIcon` ya no lo dice.
+            action.setProperty("iconName", icon_name)
+            action.setProperty("iconColor", color)
         if shortcut:
             action.setShortcut(QKeySequence(shortcut))
             action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
@@ -747,9 +750,8 @@ class MainWindow(QMainWindow):
         ayuda.addAction(self.act_contact)
 
     def _build_toolbar(self) -> None:
-        bar = QToolBar("Principal", self)
+        bar = AdaptiveToolBar("Principal", self)
         bar.setObjectName("mainToolbar")
-        bar.setIconSize(QSize(22, 22))
         bar.setMovable(False)
         bar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.addToolBar(bar)

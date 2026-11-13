@@ -11,8 +11,8 @@ voz, credenciales, ajuste del sensor) no compite por espacio.
 
 ![Ventana principal de la aplicación](img/main-window.png)
 
-La ventana mide 1020×760 por defecto y no baja de 880×620. Se divide en cuatro
-zonas:
+La ventana mide 1020×760 por defecto y no baja de 880×750 (por debajo, Qt
+reparte menos altura de la que piden las filas). Se divide en cuatro zonas:
 
 | Zona | Qué contiene |
 |---|---|
@@ -25,6 +25,30 @@ La barra de herramientas repite las acciones frecuentes y la barra de estado
 muestra el último mensaje, seis indicadores de canal (voz, correo, SMS, móvil,
 mando remoto y zumbador, en azul, gris o ámbar), los ficheros de configuración
 cargados y la versión del protocolo. Ver §2.2.
+
+### 1.0 La ventana se adapta, no recorta
+
+Al estrecharse, la ventana reduce tamaños antes que cortar texto:
+
+- **El hero manda en el ancho**: no baja de 400 px. Si no hay sitio, cede la
+  tarjeta de dispositivo, que se queda con lo que sobre.
+- **El rótulo del estado y el reloj** bajan de cuerpo hasta que el texto cabe en
+  la tarjeta (`30 → 13 pt` y `46 → 20 pt`, como mucho el máximo de la hoja de
+  estilos: nunca crecen por encima). Con la ventana en su mínimo, «DESARMADA»
+  se lee a 29 pt en lugar de salirse por los lados.
+- **Las acciones del hero pasan a columna** cuando en una fila se recortarían
+  sus etiquetas. En columna se recortan también la holgura, el icono de estado
+  (`64 → 44 px`), el reloj (máximo 32 pt) y el alto de los botones (`58 → 46
+  px`), para que el hero siga cabiendo con la cuenta atrás en marcha.
+- **La barra de herramientas no esconde acciones.** Qt, cuando no cabe, deja el
+  resto en un menú «»» que en la práctica no se ve; aquí se prueba primero
+  icono + texto con iconos de 26 px y, si no cabe, se quedan solo los iconos
+  (de 26 a 16 px). Las etiquetas siguen en la descripción emergente y en los
+  menús. A 1020 px la barra va en iconos; el texto vuelve a partir de ~3000 px.
+
+Las decisiones se miden con el ancho disponible en cada momento, no con un
+tamaño fijo, así que la interfaz se recoloca sola al redimensionar la ventana.
+
 
 ### 1.1 El hero
 
@@ -634,6 +658,13 @@ editaste a mano.
   (QSS + paleta + fuentes). Los estados se pintan con propiedades dinámicas
   (`pstate` para el botón principal, `state` para el de conexión), no con
   `setStyleSheet` repartido.
+- **Tamaños que dependen del ancho**: la hoja de estilos global fija
+  `font-size: 10pt` a todos los widgets y eso manda sobre `setFont`, así que lo
+  que tiene que cambiar de tamaño se aplica con un `setStyleSheet` propio, que
+  sí gana. `StateHero` mide con `QFontMetrics` y busca por bisección el cuerpo
+  mayor que cabe; `AdaptiveToolBar` mide `sizeHint()` con cada combinación de
+  estilo y tamaño de icono, y `sizeHint` ya refleja el cambio sin esperar al
+  ciclo de eventos.
 - **Iconos**: SVG dibujados a mano en
   [`assets/icons/`](../src/alarm/ui/assets/icons/) y rasterizados con
   `QSvgRenderer`; el color se sustituye en el SVG para adaptarlos al tema.

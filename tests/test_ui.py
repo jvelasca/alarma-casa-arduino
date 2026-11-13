@@ -214,6 +214,141 @@ def test_barra_de_herramientas_expone_lo_principal(window) -> None:
         assert esperado in texts
 
 
+def _asentar(qapp: object) -> None:
+    """Deja que el layout reparta geometrias tras cambiar el tamano."""
+    for _ in range(3):
+        qapp.processEvents()  # type: ignore[attr-defined]
+
+
+def test_la_barra_no_esconde_acciones_al_estrechar_la_ventana(window, qapp) -> None:
+    """Barra adaptable: iconos en vez de botones escondidos en el menu «»».
+
+    Qt, cuando no cabe, deja el resto de acciones en un desplegable que en la
+    practica no se ve. La barra tiene que encoger hasta que quepan todas.
+    """
+    from PyQt6.QtCore import Qt
+
+    window.show()  # type: ignore[attr-defined]
+    try:
+        for ancho in (880, 1020):
+            window.resize(ancho, 760)  # type: ignore[attr-defined]
+            _asentar(qapp)
+            bar = window._toolbar  # type: ignore[attr-defined]
+            assert bar.toolButtonStyle() is Qt.ToolButtonStyle.ToolButtonIconOnly
+            assert bar.sizeHint().width() <= bar.width(), "sobra contenido: habría menú «»»"
+            for action in bar.actions():
+                if action.isSeparator():
+                    continue
+                widget = bar.widgetForAction(action)
+                assert widget is not None
+                assert widget.width() >= widget.sizeHint().width(), action.text()
+                assert widget.isVisibleTo(window), action.text()
+    finally:
+        window.hide()  # type: ignore[attr-defined]
+
+
+def test_la_barra_baja_el_icono_antes_que_recortar(qapp) -> None:
+    """A menos ancho, iconos mas pequenos; el estilo se decide por espacio."""
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtGui import QAction
+
+    from alarm.ui import theme
+    from alarm.ui.widgets import AdaptiveToolBar
+
+    def barra(ancho: int) -> AdaptiveToolBar:
+        bar = AdaptiveToolBar("Prueba")
+        for nombre in ("Armar", "Desarmar", "Silenciar", "Probar el zumbador", "Ajuste del sensor"):
+            accion = QAction(nombre, bar)
+            accion.setProperty("iconName", "shield")
+            accion.setProperty("iconColor", theme.TEXT)
+            bar.addAction(accion)
+        bar.resize(ancho, 40)
+        bar.fit()
+        return bar
+
+    estilos = {Qt.ToolButtonStyle.ToolButtonTextBesideIcon, Qt.ToolButtonStyle.ToolButtonIconOnly}
+    tamanos = []
+    estilos_usados = []
+    for ancho in (1400, 600, 300, 150):
+        bar = barra(ancho)
+        estilos_usados.append(bar.toolButtonStyle())
+        tamanos.append(bar.iconSize().width())
+        assert bar.toolButtonStyle() in estilos
+        assert AdaptiveToolBar.SIZES[-1] <= bar.iconSize().width() <= AdaptiveToolBar.SIZES[0]
+        # Los iconos se redibujan al tamano elegido, no se escalan pixeles.
+        assert bar._rendered == bar.iconSize().width()
+
+    assert estilos_usados[0] is Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+    assert estilos_usados[-1] is Qt.ToolButtonStyle.ToolButtonIconOnly
+    assert tamanos == sorted(tamanos, reverse=True), "el icono no debe crecer al encoger"
+    assert barra(1400).sizeHint().width() <= 1400
+
+
+def test_el_rotulo_del_hero_cabe_en_la_ventana_estrecha(window, qapp) -> None:
+    """«DESARMADA» se salia de la tarjeta con la ventana en su tamano minimo."""
+    from PyQt6.QtWidgets import QBoxLayout
+
+    window.show()  # type: ignore[attr-defined]
+    try:
+        window.resize(880, 750)  # type: ignore[attr-defined]
+        _asentar(qapp)
+        hero = window._hero  # type: ignore[attr-defined]
+        etiqueta = hero._state
+        margenes = hero._layout.contentsMargins()
+        disponible = hero.width() - margenes.left() - margenes.right()
+        ancho_texto = etiqueta.fontMetrics().horizontalAdvance(etiqueta.text())
+        assert hero._state_pt < hero.STATE_PT_MAX, "el rótulo debería haberse encogido"
+        assert ancho_texto <= disponible, "el rótulo sigue sin caber"
+
+        # Sin sitio para las tres etiquetas, las acciones pasan a columna y
+        # ninguna se recorta.
+        assert hero._buttons.direction() is QBoxLayout.Direction.TopToBottom
+        for boton in hero._buttons_list():
+            assert boton.width() >= boton.sizeHint().width()
+    finally:
+        window.hide()  # type: ignore[attr-defined]
+
+
+def test_el_hero_usa_su_tamano_grande_en_una_ventana_ancha(window, qapp) -> None:
+    from PyQt6.QtWidgets import QBoxLayout
+
+    window.show()  # type: ignore[attr-defined]
+    try:
+        window.resize(1600, 900)  # type: ignore[attr-defined]
+        _asentar(qapp)
+        hero = window._hero  # type: ignore[attr-defined]
+        assert hero._state_pt == hero.STATE_PT_MAX
+        assert hero._buttons.direction() is QBoxLayout.Direction.LeftToRight
+        for boton in hero._buttons_list():
+            assert boton.width() >= boton.sizeHint().width()
+    finally:
+        window.hide()  # type: ignore[attr-defined]
+
+
+def test_el_reloj_del_retardo_cabe_con_la_ventana_estrecha(window, qapp) -> None:
+    """Con la cuenta atras visible el hero no debe comerse su propio contenido."""
+    from alarm.ui import theme
+
+    window.show()  # type: ignore[attr-defined]
+    try:
+        window.resize(880, 750)  # type: ignore[attr-defined]
+        window._hero.set_state(  # type: ignore[attr-defined]
+            "arming", "ARMANDO", "Saliendo de casa: la alarma vigilará en unos segundos."
+        )
+        window._hero.set_countdown(8.4, 10, theme.WARN)  # type: ignore[attr-defined]
+        _asentar(qapp)
+        hero = window._hero  # type: ignore[attr-defined]
+        ancho_texto = hero._clock.fontMetrics().horizontalAdvance(hero._clock.text())
+        margenes = hero._layout.contentsMargins()
+        disponible = hero.width() - margenes.left() - margenes.right()
+        assert ancho_texto <= disponible
+        for boton in hero._buttons_list():
+            assert boton.width() >= boton.sizeHint().width()
+            assert boton.geometry().bottom() < hero.height(), "la acción se sale del hero"
+    finally:
+        window.hide()  # type: ignore[attr-defined]
+
+
 def test_panel_principal_se_construye(window) -> None:
     assert "Alarma" in window.windowTitle()  # type: ignore[attr-defined]
     assert window._log.topLevelItemCount() == 0  # type: ignore[attr-defined]
