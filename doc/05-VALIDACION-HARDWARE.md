@@ -11,7 +11,7 @@ verdad conectados.
 | Documento | `doc/05-VALIDACION-HARDWARE.md` |
 | Versión | 1.1 |
 | Fecha | 2026-11-13 |
-| Estado | **En ejecución** — HW-01, HW-02 y HW-03A `PASS`; el resto pendiente |
+| Estado | **En ejecución** — HW-01, HW-02 y HW-03A `PASS`; HW-06 parcial; el resto pendiente |
 | Ámbito | Arduino Mega 2560 + HC-SR501 + zumbador pasivo + aplicación de escritorio |
 | Software de referencia | `a61198a` — versión **0.1.5**, firmware **1.7.0** |
 | Audiencia | Quien monta, flashea y valida el equipo; mantenimiento |
@@ -686,7 +686,39 @@ historial.
 
 | Resultado | Fecha | Operador | Evidencia |
 |---|---|---|---|
-| pendiente | | | |
+| pendiente (parcial: pasos 1-3 y el corte por desarme del paso 4) | 2026-11-14 00:23-00:28 | jvelasca | `data\validacion\HW-06-20261114-0025-fsm.log`, `HW-06-20261114-0029-fsm-ronda2.log` |
+
+Lo medido, con las marcas de tiempo del historial (configuración de la sesión:
+salida 10 s, entrada 10 s, `siren_ms` 10 s, rearme 60 s con 2 intentos):
+
+| Paso | Medición | Resultado |
+|---|---|---|
+| 1, `DESARMADA → ARMANDO → ARMADA` | 00:26:50.260 → 00:27:00.371 = **10,11 s** | Cumple |
+| 1 (repetición) | 00:27:50.333 → 00:28:00.369 = **10,04 s** | Cumple |
+| 2, `ENTRADA` desarmada dentro del plazo | 00:27:22.075 → 00:27:28.118 = 6,04 s, sin `triggered` | Cumple |
+| 3 (ronda 1), `ENTRADA → DISPARADA` | 00:23:25.168 → 00:23:35.352 = **10,18 s** | Cumple |
+| 3 (ronda 1), sirena completa | 00:23:35.352 → 00:23:45.353 = **10,00 s** | Cumple, dentro de ±1 s |
+| 5, rearme | 00:23:45.353 → 00:24:45.353 = **60,000 s** | Cumple, cuenta desde el fin de la sirena |
+| 3 (ronda 2), `ENTRADA → DISPARADA` | 00:28:08.387 → 00:28:18.372 = **9,99 s** | Cumple |
+| 3 (ronda 2), sirena cortada por desarme | 00:28:18.372 → 00:28:21.915 = **3,54 s** | Se cortó al desarmar, como debe |
+
+`REARMANDO → ARMADA` dejó la fila `rearmed` «Rearmada tras disparo» con «rearme 1
+de 2», y el disparo la fila `triggered` con «sirena 10 s · rearme 1 de 2 en
+1 min». Las etiquetas del historial son `alarm`, `triggered`, `rearming` y
+`rearmed`, como dice §6.
+
+**Pendiente de este escenario:** silenciar con `Ctrl+Shift+M` (paso 4) y
+comprobar que la espera de rearme cuenta desde el silencio; agotar los 2
+rearmes hasta `Rearme automático agotado` (paso 5); la retoma de la sirena tras
+un reinicio por DTR (paso 6); y cerrar la ventana con la sirena en curso
+(paso 7). Sin esos cuatro puntos el escenario **no** se marca `PASS`.
+
+**Observación de la sesión:** con los plazos acortados, el enfriamiento de
+avisos (`cooldown_s` 180) suprime correo y push de los armados y desarmados
+seguidos y deja filas `bounce` (««Alarma armada» bloqueado por enfriamiento o
+cola llena»). La voz y el pitido suenan igual: lo que se bloquea es el aviso
+remoto. No es un `FAIL`, es el límite de F4 que `00-PREMISAS.md` §11 documenta,
+pero conviene saberlo antes de contar avisos en esta campaña.
 
 ### HW-07 — Watchdog e identidad de arranque (observacional)
 
@@ -777,7 +809,7 @@ sin cubrir el criterio de F4.
 | HW-04C | Desbordamiento del buffer | | | | | pendiente | |
 | HW-05 | Corte de alimentación del PC | | | | | pendiente | |
 | HW-05D | Fallo simultáneo de SQLite y buzón | | | | | pendiente | |
-| HW-06 | Sirena y FSM reales | | | | | pendiente | |
+| HW-06 | Sirena y FSM reales | 2026-11-14 00:28 | jvelasca | `COM3` | 1.7.0 | pendiente (parcial: retardos, disparo, sirena de 10 s y un rearme medidos) | `data\validacion\HW-06-20261114-0025-fsm.log`, `HW-06-20261114-0029-fsm-ronda2.log` |
 | HW-07 | Watchdog (observacional) | | | | | pendiente (su resultado será **BLOQUEADO**) | |
 | HW-08 | 72 h (opcional) | | | | | pendiente | |
 
