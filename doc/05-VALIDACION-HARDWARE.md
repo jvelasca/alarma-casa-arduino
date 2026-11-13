@@ -11,7 +11,7 @@ verdad conectados.
 | Documento | `doc/05-VALIDACION-HARDWARE.md` |
 | Versión | 1.1 |
 | Fecha | 2026-11-13 |
-| Estado | **En ejecución** — HW-01 y HW-02 `PASS`; el resto pendiente |
+| Estado | **En ejecución** — HW-01, HW-02 y HW-03A `PASS`; el resto pendiente |
 | Ámbito | Arduino Mega 2560 + HC-SR501 + zumbador pasivo + aplicación de escritorio |
 | Software de referencia | `a61198a` — versión **0.1.5**, firmware **1.7.0** |
 | Audiencia | Quien monta, flashea y valida el equipo; mantenimiento |
@@ -47,7 +47,7 @@ fase posterior, con su propio PR y su propia revisión.
 |---|---|---|---|
 | Software en simulación | Lógica de la FSM, protocolo, persistencia, avisos | `pytest`, `tools/alarmctl.py --sim info`, Qt *offscreen* | **Certificado** (616 pruebas, §1) |
 | Compilación del firmware | El sketch compila para `arduino:avr:mega` | HW-01 | **PASS** |
-| Enlace serie real | `hello`, `hb`, `evt`, `ack` sobre USB | HW-02, HW-03A | **PASS** (HW-02: `hello` y `hb`); `evt`/`ack` pendientes |
+| Enlace serie real | `hello`, `hb`, `evt`, `ack` sobre USB | HW-02, HW-03A | **PASS** (HW-02 y HW-03A); `evt` pendiente |
 | Errores de comando | `err` con `badop` y `oversize` | HW-03B | **BLOQUEADO** (sin remitente de líneas crudas) |
 | Buffer y ACK | 16 eventos, reenvío, `lost`, deduplicación | HW-04 | Pendiente |
 | Durabilidad | SQLite `FULL`, spool, recuperación tras corte | HW-05 | Pendiente |
@@ -156,7 +156,7 @@ reinicio por DTR.
 
 1. **HW-01** primero: si no compila, no hay nada que probar. **PASS.**
 2. **HW-02** y **HW-03A**: enlace y órdenes, que es la base de todo lo demás.
-   HW-02 `PASS`; HW-03B y el rechazo con `buzzer=0` constan `BLOQUEADO` y no
+   Los dos `PASS`; HW-03B y el rechazo con `buzzer=0` constan `BLOQUEADO` y no
    interrumpen el orden.
 3. **HW-06**: sirena y FSM, con la ventana abierta y plazos acortados.
 4. **HW-04** y **HW-05**: desconexiones y cortes, que ensucian el estado y se
@@ -400,9 +400,21 @@ evidencia en esta campaña: está `BLOQUEADO`.
 
 | Resultado | Fecha | Operador | Evidencia |
 |---|---|---|---|
-| pendiente (HW-03A) | | | |
+| **PASS** (HW-03A, patrones) | 2026-11-14 00:19 | jvelasca | `data\validacion\HW-03A-20261114-0019-patrones.log` — diez órdenes, `exit=0` en todas |
 | **BLOQUEADO** (HW-03B) | 2026-11-13 | jvelasca | — sin remitente de líneas crudas: `argparse` en `alarmctl` y `serial_watch.ps1` de solo lectura |
 | **BLOQUEADO** (HW-03A, rechazo con `buzzer=0`) | 2026-11-13 | jvelasca | — el interruptor del zumbador vive en RAM y el DTR lo repone al abrir el puerto |
+
+Los diez comandos (`armed`, `disarmed`, `detect`, `error`, `test`, `tone
+--freq 2700 --ms 1500`, `exit --ms 8000`, `entry --ms 8000`, `alarm --ms 4000`
+y `stop`) devolvieron `OK` y código 0. `alarmctl` no imprime el `id` ni el `op`
+del `ack`: espera el acuse del `id` que envió y, si no llega, falla con «sin
+respuesta al comando beep», así que el `exit=0` es la prueba de que el acuse
+casó. `stop` respondió `ok` sin nada sonando, como exige el criterio.
+
+La parte que no deja rastro en un log la confirmó el operador: los nueve
+patrones se distinguen entre sí y la sirena de `alarm --ms 4000` calló a los
+~4 s, no a los 120 s por defecto. Ese juicio se anota aquí y no se deduce del
+código.
 
 ### HW-04 — Buffer de 16, reenvío y desconexiones
 
@@ -758,7 +770,7 @@ sin cubrir el criterio de F4.
 |---|---|---|---|---|---|---|---|
 | HW-01 | Compilación reproducible | 2026-11-13 23:24 | jvelasca | — (compilación, sin placa) | 1.7.0 | **PASS** | `data\validacion\HW-01-20261113-2324-compile.log` |
 | HW-02 | Flasheo, sesión y saludo | 2026-11-14 00:14 | jvelasca | `COM3` | 1.7.0 | **PASS** | `data\validacion\HW-02-20261114-0014-hello-{a,b}.log`, `HW-02-20261114-0015-skipwarmup.log` |
-| HW-03A | Órdenes y patrones del zumbador | | | | | pendiente (rechazo con `buzzer=0`: **BLOQUEADO**) | |
+| HW-03A | Órdenes y patrones del zumbador | 2026-11-14 00:19 | jvelasca | `COM3` | 1.7.0 | **PASS** (rechazo con `buzzer=0`: **BLOQUEADO**) | `data\validacion\HW-03A-20261114-0019-patrones.log` |
 | HW-03B | `err` por `badop`/`oversize` | 2026-11-13 | jvelasca | — | 1.7.0 | **BLOQUEADO** | — sin remitente de líneas crudas (§6 HW-03B) |
 | HW-04A | Tirón de USB (reinicio) | | | | | pendiente | |
 | HW-04B | Pérdida de enlace con placa viva | | | | | pendiente (**BLOQUEADO** esperado con CH340) | |
@@ -824,8 +836,9 @@ La formulación que se puede sostener mientras falte algo de lo anterior es la
 misma que la del cierre de software:
 
 > Versión 0.1.5 integrada en `main`, revisión de software cerrada y CI en verde.
-> Certificación de hardware pendiente: compilación y flasheo superados (HW-01 y
-> HW-02 `PASS`), pruebas de comportamiento físico sin ejecutar.
+> Certificación de hardware pendiente: compilación, flasheo y órdenes del
+> zumbador superados (HW-01, HW-02 y HW-03A `PASS`), comportamiento físico de la
+> FSM, del buffer y de la durabilidad sin ejecutar.
 
 Cuando la campaña termine, será este documento —y no una impresión— lo que
 permita cambiar esa frase.
