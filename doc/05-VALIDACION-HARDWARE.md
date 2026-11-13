@@ -686,10 +686,12 @@ historial.
 
 | Resultado | Fecha | Operador | Evidencia |
 |---|---|---|---|
-| pendiente (parcial: pasos 1-3 y el corte por desarme del paso 4) | 2026-11-14 00:23-00:28 | jvelasca | `data\validacion\HW-06-20261114-0025-fsm.log`, `HW-06-20261114-0029-fsm-ronda2.log` |
+| pendiente (parcial: retardos, disparo, sirena, silencio y un rearme medidos) | 2026-11-14 00:23-00:33 | jvelasca | `data\validacion\HW-06-20261114-0025-fsm.log`, `-0029-fsm-ronda2.log`, `-0033-silencio.log` |
 
-Lo medido, con las marcas de tiempo del historial (configuración de la sesión:
-salida 10 s, entrada 10 s, `siren_ms` 10 s, rearme 60 s con 2 intentos):
+Lo medido, con las marcas de tiempo del historial. La configuración cambió a
+mitad de sesión: las rondas 1 y 2 usaron salida y entrada de 10 s, `siren_ms` de
+10 s y rearme de 60 s; la ronda 3, salida y entrada de **20 s**, `siren_ms` de
+10 s y rearme de **300 s** con 2 intentos.
 
 | Paso | Medición | Resultado |
 |---|---|---|
@@ -701,17 +703,21 @@ salida 10 s, entrada 10 s, `siren_ms` 10 s, rearme 60 s con 2 intentos):
 | 5, rearme | 00:23:45.353 → 00:24:45.353 = **60,000 s** | Cumple, cuenta desde el fin de la sirena |
 | 3 (ronda 2), `ENTRADA → DISPARADA` | 00:28:08.387 → 00:28:18.372 = **9,99 s** | Cumple |
 | 3 (ronda 2), sirena cortada por desarme | 00:28:18.372 → 00:28:21.915 = **3,54 s** | Se cortó al desarmar, como debe |
+| 3 (ronda 3), `ENTRADA → DISPARADA` | 00:32:13.556 → 00:32:33.614 = **20,06 s** (entrada de 20 s) | Cumple |
+| 4 (ronda 3), silenciar con la sirena en curso | disparo 00:32:33.614 → `DISPARADA → SILENCIADA` 00:32:42.259 | La sirena calló en el acto, 8,6 s después del disparo |
+| 4 (ronda 3), la espera de rearme empieza al silenciar | silencio 00:32:42.259 → `rearming` 00:32:44.575 | 2,3 s: la fila sale en el siguiente tic del reloj, con «rearme en 5 min» |
 
 `REARMANDO → ARMADA` dejó la fila `rearmed` «Rearmada tras disparo» con «rearme 1
 de 2», y el disparo la fila `triggered` con «sirena 10 s · rearme 1 de 2 en
 1 min». Las etiquetas del historial son `alarm`, `triggered`, `rearming` y
-`rearmed`, como dice §6.
+`rearmed`, como dice §6; el silencio también va con `alarm`, y su detalle es
+«DISPARADA → SILENCIADA».
 
-**Pendiente de este escenario:** silenciar con `Ctrl+Shift+M` (paso 4) y
-comprobar que la espera de rearme cuenta desde el silencio; agotar los 2
-rearmes hasta `Rearme automático agotado` (paso 5); la retoma de la sirena tras
-un reinicio por DTR (paso 6); y cerrar la ventana con la sirena en curso
-(paso 7). Sin esos cuatro puntos el escenario **no** se marca `PASS`.
+**Pendiente de este escenario:** agotar los 2 rearmes hasta `Rearme automático
+agotado` (paso 5); la retoma de la sirena tras un reinicio por DTR (paso 6); y
+cerrar la ventana con la sirena en curso (paso 7). En la ronda 3 se silenció y
+se desarmó antes de que venciera el rearme de 5 min, así que el paso 4 queda
+medido pero el 5 no se llegó a ejercitar. El escenario **no** se marca `PASS`.
 
 **Observación de la sesión:** con los plazos acortados, el enfriamiento de
 avisos (`cooldown_s` 180) suprime correo y push de los armados y desarmados
@@ -809,7 +815,7 @@ sin cubrir el criterio de F4.
 | HW-04C | Desbordamiento del buffer | | | | | pendiente | |
 | HW-05 | Corte de alimentación del PC | | | | | pendiente | |
 | HW-05D | Fallo simultáneo de SQLite y buzón | | | | | pendiente | |
-| HW-06 | Sirena y FSM reales | 2026-11-14 00:28 | jvelasca | `COM3` | 1.7.0 | pendiente (parcial: retardos, disparo, sirena de 10 s y un rearme medidos) | `data\validacion\HW-06-20261114-0025-fsm.log`, `HW-06-20261114-0029-fsm-ronda2.log` |
+| HW-06 | Sirena y FSM reales | 2026-11-14 00:23-00:33 | jvelasca | `COM3` | 1.7.0 | pendiente (parcial: retardos, disparo, sirena, silencio y rearme medidos; faltan agotar rearmes, retoma tras DTR y cierre con sirena) | `data\validacion\HW-06-20261114-0025-fsm.log`, `-0029-fsm-ronda2.log`, `-0033-silencio.log` |
 | HW-07 | Watchdog (observacional) | | | | | pendiente (su resultado será **BLOQUEADO**) | |
 | HW-08 | 72 h (opcional) | | | | | pendiente | |
 
