@@ -340,6 +340,13 @@ queda en el buffer de la placa y la ventana muestra un aviso rojo
 `REGISTRO NO PERSISTENTE` con los eventos pendientes. El spool se reimporta solo
 en cuanto la base vuelve a estar disponible, y la importación es idempotente.
 
+Desde 0.1.5 la garantía se sostiene en dos puntos más: SQLite confirma con
+`synchronous=FULL`, de modo que el `COMMIT` ya está en disco cuando se manda el
+acuse (con `NORMAL` un corte de alimentación podía deshacer la última
+transacción ya confirmada); y si la escritura falla, la máquina de estados
+vuelve a su estado anterior en vez de quedarse disparada, para que el reenvío
+ejecute la sirena y los avisos que correspondían.
+
 La deduplicación es por **`(boot_id, seq)`**. `boot_id` es un contador de 32
 bits que la placa guarda en EEPROM y anuncia en `hello`, así que un evento
 reenviado tras una reconexión no vuelve a disparar la alarma ni a mandar

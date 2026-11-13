@@ -75,6 +75,27 @@ class Transition:
         return self.previous is not self.current
 
 
+@dataclass(frozen=True, slots=True)
+class ControllerSnapshot:
+    """Estado interno del controlador en un instante, para poder deshacerlo.
+
+    Es un punto de control en memoria, no el snapshot que se guarda en disco:
+    conserva los plazos tal cual estan (reloj monotono incluido) y los limites
+    de aviso ya consumidos. Se usa cuando un evento se calculo pero no se pudo
+    persistir: la maquina vuelve exactamente a donde estaba y el reenvio de la
+    placa produce la misma transicion, con sus efectos una sola vez.
+    """
+
+    state: AlarmState
+    silenced: bool
+    deadline: float | None
+    delay_total_s: float
+    siren_deadline: float | None
+    rearm_count: int
+    last_cause: tuple[tuple[str, float], ...]
+    sent: tuple[float, ...]
+
+
 class AlarmController:
     """Maquina de estados con retardos de entrada y salida.
 
@@ -394,7 +415,36 @@ class AlarmController:
         """
         self._siren_s = max(0.0, float(seconds))
 
-    # -- Recuperacion tras un reinicio -------------------------------------
+    # -- Punto de control y recuperacion -----------------------------------
+
+    def capture(self) -> ControllerSnapshot:
+        """Copia el estado interno para poder volver a el con ``restore``.
+
+        Incluye los plazos y los contadores de aviso: si el evento que los
+        movio no se pudo guardar, dejarlos avanzados haria que el reenvio no
+        encontrara nada que contar y la sirena no sonara.
+        """
+        return ControllerSnapshot(
+            state=self._state,
+            silenced=self._silenced,
+            deadline=self._deadline,
+            delay_total_s=self._delay_total_s,
+            siren_deadline=self._siren_deadline,
+            rearm_count=self._rearm_count,
+            last_cause=tuple(self._last_cause.items()),
+            sent=tuple(self._sent),
+        )
+
+    def restore(self, snapshot: ControllerSnapshot) -> None:
+        """Devuelve el controlador al instante capturado por ``capture``."""
+        self._state = snapshot.state
+        self._silenced = snapshot.silenced
+        self._deadline = snapshot.deadline
+        self._delay_total_s = snapshot.delay_total_s
+        self._siren_deadline = snapshot.siren_deadline
+        self._rearm_count = snapshot.rearm_count
+        self._last_cause = dict(snapshot.last_cause)
+        self._sent = deque(snapshot.sent)
 
     def to_snapshot(self, now: float | None = None) -> dict[str, object]:
         """Estado completo para poder retomarlo tras un cierre.

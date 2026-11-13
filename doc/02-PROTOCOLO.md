@@ -268,7 +268,10 @@ emparejar peticion y respuesta.
   real.
 - **Replay.** Al recibir el primer `hello` de cada sesion, el PC pide
   `cmd replay`: la placa reemite los eventos que siguen sin acusar. Los ya
-  procesados se descartan y se cuentan en `stats.duplicates`.
+  procesados no repiten efectos, se cuentan en `stats.duplicates` y **se
+  vuelven a acusar** (`ack_events(..., repeat=True)`). Sin ese segundo
+  `ackevt`, un ACK perdido con el cable dejaria el evento en el buffer de la
+  placa para siempre hasta llenar sus 16 posiciones.
 - **Desbordamiento.** Si el buffer se llena, se descarta el mas antiguo y se
   incrementa `lost`, que viaja en cada latido. Nunca se pierde en silencio: el
   PC lo muestra al recibir el latido.
@@ -282,9 +285,13 @@ emparejar peticion y respuesta.
   (hasta 64) y se despacha cuando llega el saludo, ya con el `boot_id` de la
   sesion. Nunca se entrega sin identidad.
 - **Acuse de una sesion anterior.** `ack_events(seq, boot_id)` ignora un acuse
-  cuyo `boot_id` ya no es el de la sesion actual. Si no, confirmar el `seq` de
-  la placa reiniciada borraria eventos de la sesion nueva, que empieza otra vez
-  en 1.
+  cuyo `boot_id` no es el de la sesion actual, **incluido** el intervalo en que
+  aun no se conoce la sesion nueva (`_boot_id is None`, entre detectar un
+  reinicio por regresion de `up_ms` y recibir su `hello`). Si no, confirmar el
+  `seq` de la placa reiniciada borraria eventos de la sesion nueva, que empieza
+  otra vez en 1. El ACK pendiente lleva ademas una generacion de sesion que se
+  comprueba justo antes de escribir, y `_flush_control()` manda primero el
+  `hello` y despues el `ackevt`: un acuse nunca sale sin sesion identificada.
 - **Lineas invalidas.** Se descartan y se cuentan en `stats.decode_errors`.
   Nunca detienen el bucle de lectura.
 - **Latido.** Si no llega ninguna linea durante `hb_timeout` (8 s por defecto),

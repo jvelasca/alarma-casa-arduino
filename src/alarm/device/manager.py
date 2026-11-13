@@ -124,6 +124,11 @@ class DeviceManager:
         # toca el puerto y el ACK sale en la siguiente vuelta del bucle.
         self._ack_target = 0
         self._ack_dirty = False
+        # Generacion de la sesion a la que pertenece el ACK apuntado. Un acuse
+        # de la sesion anterior no puede salir por el puerto despues de que la
+        # placa haya empezado otra: borraria eventos de la sesion nueva.
+        self._session_gen = 0
+        self._ack_gen = 0
         self._replay_pending = False
         # Peticion de `hello` desde el hilo lector cuando el latido delata un
         # reinicio que no llego a verse como tal.
@@ -294,7 +299,7 @@ class DeviceManager:
             time.sleep(0.02)
         return self.hello
 
-    def ack_events(self, seq: int, boot_id: int | None = None) -> None:
+    def ack_events(self, seq: int, boot_id: int | None = None, *, repeat: bool = False) -> None:
         """Confirma eventos hasta ``seq``. Seguro desde cualquier hilo.
 
         El ACK solo debe llegar cuando el consumidor ha procesado el evento y
@@ -305,19 +310,30 @@ class DeviceManager:
         ``boot_id`` evita un fallo sutil: si la placa se reinicio entre que el
         evento se proceso y que se confirma, ``seq`` pertenece a una sesion que
         ya no existe. Confirmarla borraria eventos de la sesion nueva, que
-        empieza otra vez en 1.
+        empieza otra vez en 1. Por el mismo motivo se rechaza cualquier acuse
+        con ``boot_id`` conocido mientras la sesion en curso aun no esta
+        identificada (``_boot_id is None``): en ese intervalo pertenece a la
+        sesion anterior.
+
+        ``repeat`` es para un evento reenviado que ya se habia confirmado: se
+        vuelve a escribir el ACK —de eso depende que la placa lo borre de su
+        buffer— pero no se repiten los efectos, porque el consumidor ya lo
+        deduplica por ``(boot_id, seq)``. Sin ``repeat`` el acuse es monotono
+        y no se reescribe.
         """
         if seq <= 0:
             return
         with self._lock:
-            if boot_id is not None and self._boot_id is not None and boot_id != self._boot_id:
+            if boot_id is not None and boot_id != self._boot_id:
                 log.debug("acuse ignorado: sesion %s, actual %s", boot_id, self._boot_id)
                 return
-            if seq <= self.last_seq_acked:
+            if not repeat and seq <= self.last_seq_acked:
                 return
-            # Monotono y acumulativo: confirmar N confirma todo lo anterior.
-            self.last_seq_acked = seq
-            self._ack_target = seq
+            if seq > self.last_seq_acked:
+                # Monotono y acumulativo: confirmar N confirma todo lo anterior.
+                self.last_seq_acked = seq
+            self._ack_target = max(self._ack_target, seq)
+            self._ack_gen = self._session_gen
             self._ack_dirty = True
 
     # -- Bucle interno -----------------------------------------------------
@@ -387,27 +403,37 @@ class DeviceManager:
             self._dispatch(message)
 
     def _flush_control(self) -> None:
-        """Escribe el ACK, el `hello` y el `replay` pendientes."""
+        """Escribe el `hello`, el ACK y el `replay` pendientes, en ese orden.
+
+        El saludo va primero porque identifica la sesion: un ACK solo puede
+        salir cuando ya se conoce la sesion en curso. Asi no hay ventana en la
+        que un acuse de la placa anterior se escriba justo antes del `hello`
+        que anuncia la nueva y borre sus eventos.
+        """
         with self._lock:
-            ack = self._ack_target if self._ack_dirty else 0
+            ack = self._ack_target if self._ack_allowed() else 0
             replay = self._replay_pending
             self._replay_pending = False
             hello = self._hello_pending
             self._hello_pending = False
-        if ack:
-            # Solo se marca limpio si no aparecio otro ACK mientras se escribia.
-            self._link.write_line(encode_ack_events(ack))
-            with self._lock:
-                if self._ack_target == ack:
-                    self._ack_dirty = False
         if hello:
             # Reclamado cuando el latido delata un reinicio que no vimos: hace
             # falta el saludo nuevo para conocer el `boot_id` de la sesion.
             self._link.write_line(self._new_cmd("hello"))
+        if ack:
+            # Solo se marca limpio si no aparecio otro ACK mientras se escribia.
+            self._link.write_line(encode_ack_events(ack))
+            with self._lock:
+                if self._ack_target == ack and self._ack_gen == self._session_gen:
+                    self._ack_dirty = False
         if replay:
             # Los eventos que la placa no habia confirmado se reenvian ahora;
             # los ya procesados se descartan por `(boot_id, seq)`.
             self._link.write_line(self._new_cmd("replay"))
+
+    def _ack_allowed(self) -> bool:
+        """Si el ACK apuntado pertenece a la sesion en curso. Con el cerrojo."""
+        return self._ack_dirty and self._session_hello and self._ack_gen == self._session_gen
 
     def _new_cmd(self, op: str) -> str:
         """Reserva un id y devuelve la orden ya codificada."""
@@ -471,6 +497,9 @@ class DeviceManager:
             self._link.close()
         self._opened_at = None
         self._connected.clear()
+        # Al cerrar no hay sesion viva: ningun ACK pendiente puede escribirse
+        # hasta que el `hello` de la proxima identificacion llegue.
+        self._session_hello = False
 
     def _dispatch(self, message: Message) -> None:
         # Cualquier linea valida demuestra que el enlace esta vivo.
@@ -559,7 +588,11 @@ class DeviceManager:
             self._ack_target = 0
             self._ack_dirty = False
             self._replay_done = False
-        self._boot_id = hello.boot_id
+            # Todo ACK apuntado hasta ahora era de la sesion anterior: la
+            # generacion lo invalida aunque su `seq` pudiera parecer valido.
+            self._session_gen += 1
+            self._ack_gen = self._session_gen
+            self._boot_id = hello.boot_id
         self._last_up_ms = None
         if previous is not None:
             self.stats.reboots += 1
@@ -597,8 +630,13 @@ class DeviceManager:
             self._ack_dirty = False
             self._replay_done = False
             self._hello_pending = True
+            # El ACK que hubiera apuntado pertenece a la sesion que acaba de
+            # morir: la generacion lo descarta y `_boot_id = None` rechaza
+            # cualquier acuse que llegue con la identidad vieja.
+            self._session_gen += 1
+            self._ack_gen = self._session_gen
+            self._boot_id = None
         self._session_hello = False
-        self._boot_id = None
         self.stats.reboots += 1
         self._reboot_reason = "power"
         log.warning("el latido retrocede a %d ms: la placa se ha reiniciado", up_ms)
@@ -617,9 +655,15 @@ class DeviceManager:
             already = tagged.seq <= self.last_seq_acked
         if already:
             # Reenvio de un evento ya procesado y confirmado. Se cuenta y no se
-            # entrega: el consumidor no debe registrar dos veces.
+            # vuelve a entregar: el consumidor no debe registrar dos veces.
+            # Pero SI se vuelve a acusar: si el ACK anterior se perdio con el
+            # cable, la placa conserva el evento en su buffer y este es el
+            # unico momento de borrarlo. Con `auto_ack` lo hace el gestor; sin
+            # el, se entrega para que confirme quien ya lo tiene persistido.
             self.stats.duplicates += 1
-            return
+            if self._auto_ack:
+                self.ack_events(tagged.seq, tagged.boot_id, repeat=True)
+                return
         if self._auto_ack:
             self.ack_events(tagged.seq, tagged.boot_id)
         handler = self.on_message

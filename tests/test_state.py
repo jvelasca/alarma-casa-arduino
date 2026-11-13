@@ -703,3 +703,68 @@ def test_un_estado_guardado_ilegible_arranca_desarmado() -> None:
     )
     assert restaurado.state is AlarmState.DISARMED
     assert restaurado.armed is False
+
+
+# ---------------------------------------------------------------------------
+# Punto de control: deshacer un evento que no se pudo persistir (H-01)
+# ---------------------------------------------------------------------------
+
+
+def test_restore_devuelve_la_maquina_al_instante_capturado() -> None:
+    now = [100.0]
+    controller = _controlador(now, exit_delay_s=45, auto_rearm=False)
+    controller.arm()
+    assert controller.state is AlarmState.ARMING
+    restante = controller.remaining_s()
+
+    antes = controller.capture()
+    now[0] += 20
+    controller.disarm()
+    assert controller.state is AlarmState.DISARMED
+
+    controller.restore(antes)
+    assert controller.state is AlarmState.ARMING
+    # El vencimiento es absoluto: se conserva el mismo instante, no el mismo
+    # numero de segundos (el reloj ha seguido andando).
+    assert controller.remaining_s() == pytest.approx((restante or 0.0) - 20)
+    assert controller.rearm_count == 0
+
+
+def test_restore_hace_que_el_reenvio_reproduzca_la_transicion() -> None:
+    """Sin deshacer, el reenvio encontraria la maquina ya avanzada y daria None."""
+    now = [100.0]
+    controller = _controlador(now, entry_delay_s=0, auto_rearm=False)
+    controller.arm()
+    assert controller.state is AlarmState.ARMED
+
+    antes = controller.capture()
+    primera = controller.feed(_start())
+    assert primera is not None
+    assert primera.action == ACTION_TRIGGERED
+    assert controller.state is AlarmState.TRIGGERED
+
+    # El evento no se pudo guardar: se deshace y la placa lo reenvia.
+    controller.restore(antes)
+    assert controller.state is AlarmState.ARMED
+    assert controller.siren_remaining_s() is None
+
+    segunda = controller.feed(_start())
+    assert segunda is not None, "el reenvio tiene que volver a disparar"
+    assert segunda.action == ACTION_TRIGGERED
+    assert segunda.previous is AlarmState.ARMED
+    assert controller.state is AlarmState.TRIGGERED
+
+
+def test_restore_deshace_tambien_los_limites_de_aviso() -> None:
+    """Los avisos consumidos forman parte del estado capturado."""
+    now = [0.0]
+    controller = _controlador(now, entry_delay_s=0, cooldown_s=0, max_per_hour=2)
+    controller.arm()
+    assert controller.allow("triggered") is True
+
+    antes = controller.capture()
+    assert controller.allow("triggered") is True
+    assert controller.allow("triggered") is False, "el tope por hora ya se consumio"
+
+    controller.restore(antes)
+    assert controller.allow("triggered") is True, "vuelve a haber el mismo cupo"

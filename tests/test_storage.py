@@ -494,3 +494,29 @@ def test_una_base_de_la_version_anterior_se_migra_sola(tmp_path: Path) -> None:
         assert store.has_processed(4, 1) is True
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# Durabilidad: el ACK promete que el commit sobrevivio al corte de luz
+# ---------------------------------------------------------------------------
+
+
+def test_el_historial_usa_wal_y_synchronous_full(tmp_path: Path) -> None:
+    """H-01 adicional: NORMAL pierde la ultima transaccion en un apagon.
+
+    El evento se acusa a la placa porque `record_motion` termino bien. Con
+    `synchronous=NORMAL` en WAL eso no garantiza que la transaccion este en
+    disco: un corte de alimentacion puede deshacer la fila ya confirmada y el
+    ACK habria borrado de la placa la unica copia. FULL fuerza el fsync del
+    commit antes de devolver el control.
+    """
+    store = _abrir(tmp_path / "alarm.db")
+    try:
+        # Se consulta la conexion del propio almacen: `synchronous` es un
+        # ajuste por conexion, asi que abrir otra daria el valor por defecto.
+        modo = store._con.execute("PRAGMA journal_mode").fetchone()  # noqa: SLF001
+        sincronia = store._con.execute("PRAGMA synchronous").fetchone()  # noqa: SLF001
+        assert modo is not None and str(modo[0]).lower() == "wal"
+        assert sincronia is not None and int(sincronia[0]) == 2, "2 = FULL"
+    finally:
+        store.close()

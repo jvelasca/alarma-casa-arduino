@@ -258,8 +258,14 @@ class EventStore:
             # WAL deja leer mientras se escribe y aguanta mejor un corte de luz.
             with suppress(sqlite3.Error):
                 self._con.execute("PRAGMA journal_mode=WAL")
+            # FULL, no NORMAL: el ACK que se manda a la placa promete que el
+            # commit sobrevivio al corte de alimentacion. Con NORMAL en WAL,
+            # SQLite conserva la integridad pero puede perder la ultima
+            # transaccion confirmada, que es justo la que se acaba de acusar.
+            # Cuesta un fsync por evento; a la frecuencia de un PIR es
+            # irrelevante y es el precio de que el ACK signifique algo.
             with suppress(sqlite3.Error):
-                self._con.execute("PRAGMA synchronous=NORMAL")
+                self._con.execute("PRAGMA synchronous=FULL")
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -276,7 +282,16 @@ class EventStore:
             with suppress(sqlite3.Error):
                 self._con.execute("ROLLBACK")
             raise
-        self._con.execute("COMMIT")
+        try:
+            self._con.execute("COMMIT")
+        except BaseException:
+            # Un COMMIT que falla (disco lleno, E/S) deja la transaccion
+            # abierta: sin deshacerla, el siguiente BEGIN IMMEDIATE fallaria
+            # y el historial quedaria inservible hasta reiniciar. El evento se
+            # va al buzon, como si la escritura no hubiera empezado.
+            with suppress(sqlite3.Error):
+                self._con.execute("ROLLBACK")
+            raise
 
     # -- Escritura ---------------------------------------------------------
 

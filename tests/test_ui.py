@@ -628,10 +628,68 @@ def test_un_evento_ya_procesado_se_reconfirma_sin_repetir_efectos(window) -> Non
 
     # El mismo evento llega otra vez (ACK perdido y replay): no vuelve a
     # disparar la alarma, pero si se confirma para que la placa lo borre.
+    # El acuse es `repeat`: mismo numero, que la placa ya confirmo una vez,
+    # pero tiene que volver a escribirse o el evento se queda en su buffer.
     manager.acked.clear()
+    manager.repeated.clear()
     window._on_message(primero)
     assert window._hero._state.text() == "DESARMADA"
     assert manager.acked == [5]
+    assert manager.repeated == [5]
+
+
+def test_si_falla_la_persistencia_la_fsm_vuelve_atras(window) -> None:
+    """H-01: un evento no guardado no puede dejar la maquina avanzada.
+
+    Si `feed()` dejara la FSM en TRIGGERED y la escritura fallara, el reenvio
+    encontraria la maquina ya disparada, `feed()` devolveria None y la sirena
+    no sonaria nunca. El orden declarado es persistir y despues actuar.
+    """
+    from alarm.core.state import AlarmState
+    from alarm.protocol.messages import MotionEvent, MotionKind
+
+    manager = FakeManager()
+    window._manager = manager
+    window.disarm()
+    window.arm()
+    assert window._controller.state is AlarmState.ARMED
+
+    def romper(*args: object, **kwargs: object) -> object:
+        raise OSError("disco lleno")
+
+    original_record = window._store.record_motion
+    original_append = window._spool.append
+    window._store.record_motion = romper  # type: ignore[method-assign]
+    window._spool.append = lambda record: False  # type: ignore[method-assign, assignment]
+
+    evento = MotionEvent(seq=31, kind=MotionKind.START, zone=1, ms=1000, boot_id=1)
+    try:
+        voz_antes = len(window._speech.spoken)
+        avisos_antes = len(window._notifier.submitted)
+        window._on_message(evento)
+
+        assert window._controller.state is AlarmState.ARMED, "la FSM tiene que volver"
+        assert manager.acked == [], "sin persistencia no hay ACK"
+        assert len(window._speech.spoken) == voz_antes, "sin guardar no se avisa"
+        assert len(window._notifier.submitted) == avisos_antes
+    finally:
+        window._store.record_motion = original_record  # type: ignore[method-assign]
+        window._spool.append = original_append  # type: ignore[method-assign]
+
+    # La placa reenvia el evento y ahora si se puede guardar: los efectos de
+    # la transicion original tienen que ejecutarse, una sola vez.
+    window._on_message(evento)
+    assert window._controller.state is AlarmState.TRIGGERED
+    assert manager.acked == [31]
+    assert manager.repeated == []
+    assert len(window._notifier.submitted) == avisos_antes + 1
+
+    # Un segundo reenvio solo se reacusa: ni otra sirena ni otro aviso.
+    manager.acked.clear()
+    window._on_message(evento)
+    assert manager.acked == [31]
+    assert manager.repeated == [31]
+    assert len(window._notifier.submitted) == avisos_antes + 1
 
 
 def test_sin_gestor_el_evento_no_revienta_la_ventana(window) -> None:
@@ -1413,13 +1471,18 @@ class FakeManager:
         self.link = None
         self.sent: list[tuple[str, dict[str, object]]] = []
         self.acked: list[int] = []
+        # Acuses de un evento ya guardado: deben salir otra vez para que la
+        # placa lo borre, aunque no se repitan los efectos.
+        self.repeated: list[int] = []
 
     def send(self, op: str, **params: object) -> int:
         self.sent.append((op, params))
         return 1
 
-    def ack_events(self, seq: int, boot_id: int | None = None) -> None:
+    def ack_events(self, seq: int, boot_id: int | None = None, *, repeat: bool = False) -> None:
         self.acked.append(seq)
+        if repeat:
+            self.repeated.append(seq)
 
     def stop(self, timeout: float = 3.0) -> None:
         pass

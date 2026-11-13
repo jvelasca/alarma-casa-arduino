@@ -15,6 +15,56 @@ sigue [Keep a Changelog](https://keepachangelog.com/es/1.1.0/) y la numeración
 
 - Zonas, panel web y bandeja del sistema (F2-F3 de la hoja de ruta).
 
+## [0.1.5] — 2026-11-13
+
+Cierra los cuatro hallazgos que la auditoría de 0.1.4 dejó abiertos. Las
+correcciones de SQLite y del buzón de 0.1.4 eran correctas, pero la garantía
+central —detectar, registrar y actuar sin perder el evento ni dejar la sirena
+sin activar— seguía teniendo tres agujeros de lógica y uno de durabilidad. No
+hay cambios de protocolo ni de esquema: el firmware 1.7.0 sigue valiendo.
+
+### Corregido
+
+- **H-02 — un reenvío ya confirmado se vuelve a acusar.** `_deliver_event()`
+  descartaba el duplicado sin reenviar el `ackevt`. Si el ACK se perdía con el
+  cable, el evento se quedaba en el buffer de 16 de la placa indefinidamente.
+  Ahora el gestor reacusa con `ack_events(..., repeat=True)` (con `auto_ack`) o
+  entrega el reenvío para que lo reacuse la ventana, que lo reconoce por
+  `(boot_id, seq)` y no repite efectos. El acuse sigue siendo acumulativo para
+  los eventos nuevos, pero un `repeat` se vuelve a escribir aunque su número ya
+  estuviera confirmado.
+- **H-01 — la FSM no avanza sin persistencia.** `_handle_motion()` llamaba a
+  `feed()` antes de intentar SQLite y el buzón, y no lo deshacía si ambas
+  fallaban. El reenvío encontraba la máquina ya en el estado de destino,
+  `feed()` devolvía `None` y los efectos de la transición (sirena, avisos) no
+  se ejecutaban nunca. Ahora se toma un punto de control con
+  `AlarmController.capture()` y, si no hay escritura durable —o si el evento ya
+  estaba registrado—, `restore()` devuelve la máquina exactamente a donde
+  estaba, plazos y límites de aviso incluidos. El reenvío reproduce la misma
+  transición y sus efectos se ejecutan una sola vez.
+- **H-01 adicional — SQLite con `synchronous=FULL`.** En WAL, `NORMAL` conserva
+  la integridad pero puede perder la última transacción confirmada, que es justo
+  la que se acaba de acusar: un corte de alimentación del PC dejaba un ACK por
+  un evento que ya no estaba en disco. `FULL` fuerza el `fsync` del commit antes
+  de devolver el control. Un `COMMIT` que falla ahora también deshace su
+  transacción, para que la conexión no quede bloqueada hasta reiniciar.
+- **H-02 adicional — un ACK no cruza de sesión.** `ack_events()` solo rechazaba
+  un `boot_id` distinto cuando ya conocía el actual; durante el hueco en que el
+  gestor detecta un reinicio por regresión de `up_ms` y todavía no ha recibido
+  el `hello`, un ACK retrasado de la sesión anterior pasaba el filtro. Ahora
+  cualquier acuse con `boot_id` conocido se rechaza mientras la sesión en curso
+  no esté identificada, el ACK pendiente lleva una generación de sesión que se
+  comprueba justo antes de escribir, y `_flush_control()` escribe el `hello`
+  antes que el ACK.
+
+### Añadido
+
+- **Pruebas de regresión de los cuatro casos:** reacusación de un reenvío con y
+  sin `auto_ack`, reenvío tras un fallo simultáneo de SQLite y el buzón con la
+  sirena y los avisos ejecutados una sola vez en el reintento, `WAL` +
+  `synchronous=FULL`, y rechazo del ACK de la sesión anterior durante el hueco
+  sin `boot_id`.
+
 ## [0.1.4] — 2026-11-13
 
 Corrige de verdad los tres hallazgos que 0.1.3 daba por cerrados (H-01, H-02 y

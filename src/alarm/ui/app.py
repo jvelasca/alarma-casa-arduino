@@ -2557,15 +2557,20 @@ class MainWindow(QMainWindow):
 
         1. Si ``(boot_id, seq)`` ya se proceso, se vuelve a confirmar y nada
            mas: ni transicion, ni sirena, ni segundo aviso.
-        2. Se calcula la transicion en memoria.
+        2. Se calcula la transicion en memoria, guardando antes un punto de
+           control para poder deshacerla.
         3. Se persisten en UNA transaccion el evento, su clave y el estado
            resultante de la maquina. Si SQLite no puede, el mismo registro va
            al buzon con ``fsync``.
         4. Solo entonces se aplican los efectos y se confirma a la placa.
 
-        Si el paso 3 no consigue nada durable, no hay ACK. La placa conserva el
-        evento en su buffer y lo reenviara; la ventana avisa de que el registro
-        esta degradado en vez de fingir que la intrusion quedo guardada.
+        Si el paso 3 no consigue nada durable, no hay ACK y la maquina vuelve
+        al punto de control: la placa conserva el evento en su buffer y lo
+        reenviara, y entonces ``feed()`` producira la misma transicion con sus
+        efectos. Dejarla avanzada haria que el reenvio no encontrara nada que
+        contar y la sirena no sonaria. La ventana avisa ademas de que el
+        registro esta degradado en vez de fingir que la intrusion quedo
+        guardada.
         """
         boot_id = message.boot_id
         if boot_id is not None:
@@ -2575,9 +2580,12 @@ class MainWindow(QMainWindow):
                 log.debug("no se pudo comprobar el evento %d", message.seq, exc_info=True)
                 duplicate = False
             if duplicate:
-                self._ack_event(message)
+                # Ya esta guardado: se vuelve a acusar para que la placa lo
+                # borre de su buffer, pero no se repiten los efectos.
+                self._ack_event(message, repeat=True)
                 return
 
+        checkpoint = self._controller.capture()
         transition = self._controller.feed(message)
         tag, kind, detail = self._describe_motion(message)
         try:
@@ -2628,14 +2636,20 @@ class MainWindow(QMainWindow):
                     f"aceptaron la escritura ({exc})",
                 )
                 self._update_storage_warning()
+                # Sin escritura durable no hay ACK, pero tampoco puede quedar
+                # la maquina avanzada: el reenvio de la placa debe encontrar
+                # la misma transicion que se acaba de descartar.
+                self._controller.restore(checkpoint)
                 return  # sin ACK: la placa lo conserva
         else:
             persisted = True
 
         if not new:
             # Otra sesion/entrega ya lo habia registrado: se confirma de nuevo
-            # para que la placa lo borre, pero no se repiten los efectos.
-            self._ack_event(message)
+            # para que la placa lo borre, pero no se repiten los efectos. La
+            # maquina vuelve al punto de control por si `feed()` la movio.
+            self._controller.restore(checkpoint)
+            self._ack_event(message, repeat=True)
             return
 
         # El evento y el estado ya estan en disco (o en el buzon): desde aqui
@@ -2677,19 +2691,23 @@ class MainWindow(QMainWindow):
         elif message.kind is MotionKind.END:
             self._paint_sensor(False)
 
-    def _ack_event(self, message: MotionEvent) -> None:
+    def _ack_event(self, message: MotionEvent, *, repeat: bool = False) -> None:
         """Confirma el evento a la placa despues de haberlo guardado.
 
         El gestor solo apunta el numero; el hilo lector lo escribe. El
         ``boot_id`` viaja con el acuse para que no se confirme por error un
         ``seq`` de una sesion que la placa ya abandono. Si el enlace se esta
         cayendo no se pierde nada: el firmware lo reenviara al reconectar.
+
+        ``repeat`` se usa cuando el evento ya estaba en el historial: el ACK
+        tiene que volver a salir para que la placa lo borre de su buffer, pero
+        los efectos no se repiten.
         """
         manager = self._manager
         if manager is None:
             return
         try:
-            manager.ack_events(message.seq, message.boot_id)
+            manager.ack_events(message.seq, message.boot_id, repeat=repeat)
         except Exception:  # noqa: BLE001 - un ACK no puede tumbar la interfaz
             log.debug("no se pudo confirmar el evento %d", message.seq, exc_info=True)
 
