@@ -38,7 +38,7 @@ fase posterior, con su propio PR y su propia revisión.
 | Capa | Qué se demuestra | Cómo | Estado de partida |
 |---|---|---|---|
 | Software en simulación | Lógica de la FSM, protocolo, persistencia, avisos | `pytest`, `tools/alarmctl.py --sim`, Qt *offscreen* | **Certificado** (616 pruebas) |
-| Compilación del firmware | El sketch compila para `arduino:avr:mega` | HW-01 | Pendiente |
+| Compilación del firmware | El sketch compila para `arduino:avr:mega` | HW-01 | **PASS** (HW-01) |
 | Enlace serie real | `hello`, `hb`, `evt`, `ack` sobre USB; `err` queda fuera (HW-03B) | HW-02, HW-03 | Pendiente |
 | Buffer y ACK | 16 eventos, reenvío, `lost`, deduplicación | HW-04 | Pendiente |
 | Durabilidad | SQLite `FULL`, spool, recuperación tras corte | HW-05 | Pendiente |
@@ -61,17 +61,17 @@ elemento. Sin estos datos, una fila de resultado no es interpretable.
 
 | Campo | Valor |
 |---|---|
-| Fecha y hora de inicio | |
-| Operador | |
-| Placa (modelo y origen) | Mega 2560 — CH340 / ATmega16U2 |
+| Fecha y hora de inicio | 2026-11-13 23:24 — sesión de HW-01 |
+| Operador | jvelasca |
+| Placa (modelo y origen) | Mega 2560 — CH340 detectada en `COM3` (HW-01 no usa la placa) |
 | Alimentación | Solo USB / USB + VIN 7-12 V |
 | Cable USB | Datos (no solo carga) |
-| Puerto | `COM…` |
-| `arduino-cli` (ruta y versión) | |
-| Core `arduino:avr` | |
-| Windows | |
-| Firmware anunciado en `hello` | |
-| Commit bajo prueba | `a61198a` |
+| Puerto | `COM3` (detectado; HW-01 no abre el puerto) |
+| `arduino-cli` (ruta y versión) | 1.5.1 — `%LOCALAPPDATA%\Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe` |
+| Core `arduino:avr` | 1.8.8 (`arduino:avr` 1.8.8, última disponible 1.8.8) |
+| Windows | Windows 11 Pro 10.0.26200 |
+| Firmware anunciado en `hello` | — (HW-01 no abre el puerto) |
+| Commit bajo prueba | `a61198a` + `a17c084` (este último solo añade este documento) |
 | Configuración cargada | `config/alarm.toml` / `config/alarm.local.toml` |
 | Jumper del HC-SR501 y ajuste | `H` / `Tx` mínimo / `Sx` … % |
 
@@ -170,7 +170,21 @@ tamaños; y la línea de `FW_VERSION`.
 
 | Resultado | Fecha | Operador | Evidencia |
 |---|---|---|---|
-| pendiente | | | |
+| **PASS** | 2026-11-13 23:24 | jvelasca | `data\validacion\HW-01-20261113-2324-compile.log` — `exit=0`, 16 048 B de flash (6 %), 1 022 B de RAM (12 %), `FW_VERSION` 1.7.0 |
+
+`flash.ps1 -CompileOnly` salió con código 0 y sin avisos; una segunda
+compilación con `arduino-cli compile --clean` para el mismo sketch dio
+exactamente los mismos tamaños (16 048 B / 1 022 B), así que la medida no
+procede de una caché de compilación.
+
+**Nota sobre la diferencia con la referencia.** Los 15 404 B de flash y 1 018 B
+de RAM de [`00-PREMISAS.md`](00-PREMISAS.md) §4.4 se midieron con el firmware
+**1.6.0** (commit `a244f85`, entrada 0.1.2 del `CHANGELOG`). Esta compilación es
+del firmware **1.7.0**, que añade `boot_id` en EEPROM y el ACK de reenvíos. Esa
+diferencia (644 B más de flash y 4 B más de RAM) es la evolución del sketch
+entre esas dos versiones, no un cambio de entorno: el core y el `arduino-cli`
+usados quedan anotados en la hoja de banco (§3). No se considera `FAIL` ni se
+corrige la referencia dentro de esta campaña.
 
 ### HW-02 — Flasheo, sesión y saludo
 
@@ -645,7 +659,7 @@ sin cubrir el criterio de F4.
 
 | ID | Escenario | Fecha | Operador | Placa / puerto | Firmware | Resultado | Evidencia |
 |---|---|---|---|---|---|---|---|
-| HW-01 | Compilación reproducible | | | — | — | pendiente | |
+| HW-01 | Compilación reproducible | 2026-11-13 23:24 | jvelasca | — | 1.7.0 | **PASS** | `data\validacion\HW-01-20261113-2324-compile.log` |
 | HW-02 | Flasheo, sesión y saludo | | | | | pendiente | |
 | HW-03 | Órdenes y acuses | | | | | pendiente | |
 | HW-04A | Tirón de USB (reinicio) | | | | | pendiente | |
