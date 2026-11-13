@@ -35,6 +35,16 @@ def test_los_retardos_por_defecto_son_los_de_una_central() -> None:
     assert config.ui.label("pending") == "ENTRADA"
 
 
+def test_el_estado_operativo_se_restaura_por_defecto() -> None:
+    """Un reinicio no puede desarmar la casa sin que nadie lo pida."""
+    config = default_config()
+    assert config.alarm.armed_on_start is False
+    assert config.alarm.restore_state_on_start is True
+
+    apagado = from_mapping({"alarm": {"restore_state_on_start": False}})
+    assert apagado.alarm.restore_state_on_start is False
+
+
 def test_los_retardos_se_ajustan_y_se_acotan() -> None:
     config = from_mapping({"alarm": {"exit_delay_s": 90, "entry_delay_s": 0}})
     assert config.alarm.exit_delay_s == 90
@@ -299,6 +309,7 @@ def test_por_defecto_la_placa_se_conecta_sola_y_se_supervisa() -> None:
     assert config.serial.auto_connect is True
     assert config.serial.heartbeat_timeout_s == 8.0
     assert config.serial.reconnect_max_s == 30.0
+    assert config.serial.handshake_timeout_s == 3.0
 
 
 def test_el_bloque_serial_admite_la_politica_de_reconexion() -> None:
@@ -309,6 +320,7 @@ def test_el_bloque_serial_admite_la_politica_de_reconexion() -> None:
                 "auto_connect": False,
                 "reconnect_max_s": 12.5,
                 "heartbeat_timeout_s": 4.0,
+                "handshake_timeout_s": 6.0,
             }
         }
     )
@@ -316,6 +328,7 @@ def test_el_bloque_serial_admite_la_politica_de_reconexion() -> None:
     assert config.serial.auto_connect is False
     assert config.serial.reconnect_max_s == 12.5
     assert config.serial.heartbeat_timeout_s == 4.0
+    assert config.serial.handshake_timeout_s == 6.0
 
 
 @pytest.mark.parametrize(
@@ -323,6 +336,8 @@ def test_el_bloque_serial_admite_la_politica_de_reconexion() -> None:
     [
         ({"serial": {"heartbeat_timeout_s": 0.5}}, "serial.heartbeat_timeout_s"),
         ({"serial": {"reconnect_max_s": 0}}, "serial.reconnect_max_s"),
+        ({"serial": {"handshake_timeout_s": 0.2}}, "serial.handshake_timeout_s"),
+        ({"serial": {"handshake_timeout_s": 60}}, "serial.handshake_timeout_s"),
         ({"log": {"max_events": 0}}, "log.max_events"),
         ({"log": {"visible_rows": 0}}, "log.visible_rows"),
         ({"log": {"max_age_days": 0}}, "log.max_age_days"),
@@ -374,6 +389,7 @@ def test_el_ejemplo_documenta_la_conexion_y_el_historial(tmp_path: Path) -> None
     config = load_config(EXAMPLE, env={}, local=tmp_path / "no-local.toml")
     assert config.serial.auto_connect is True
     assert config.serial.heartbeat_timeout_s == 8.0
+    assert config.serial.handshake_timeout_s == 3.0
     assert config.log.max_events == 100_000
     assert config.log.max_age_days == 365
     assert config.email.on_device_lost is True

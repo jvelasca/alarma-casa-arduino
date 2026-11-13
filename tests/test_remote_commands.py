@@ -105,6 +105,67 @@ def test_una_orden_desactivada_se_rechaza_aunque_la_clave_sea_buena() -> None:
     assert "desactivada" in verdict.reason
 
 
+def test_la_ayuda_se_responde_sin_credencial() -> None:
+    """`ayuda` es informativa: no cambia nada y no puede exigir clave.
+
+    Es la orden que se teclea justo cuando algo no funciona; pedir la clave
+    para leerla dejaria al usuario sin la unica ayuda disponible.
+    """
+    auth = authorizer()
+    for text in ("ayuda", "help", "?", "AYUDA"):
+        verdict = auth.evaluate(text)
+        assert verdict.accepted, text
+        assert verdict.action == "help"
+
+
+def test_la_ayuda_funciona_con_todas_las_ordenes_desactivadas() -> None:
+    auth = authorizer(
+        allow_arm=False,
+        allow_disarm=False,
+        allow_status=False,
+        allow_silence=False,
+        allow_panic=False,
+    )
+    assert auth.evaluate("ayuda").accepted
+    assert not auth.evaluate("armar").accepted
+
+
+def test_la_ayuda_no_queda_bloqueada_por_los_intentos_fallidos() -> None:
+    auth = authorizer(lockout_failures=2)
+    auth.evaluate("mala armar")
+    auth.evaluate("mala armar")
+    assert auth.blocked
+
+    verdict = auth.evaluate("ayuda")
+    assert verdict.accepted
+    assert verdict.blocked is False
+    # Consultar la ayuda no reinicia el bloqueo ni alarga la espera.
+    assert auth.blocked
+
+
+def test_la_ayuda_no_cuenta_como_intento_fallido() -> None:
+    auth = authorizer(lockout_failures=3)
+    for _ in range(10):
+        assert auth.evaluate("ayuda").accepted
+    assert not auth.blocked
+
+
+def test_la_ayuda_no_aparece_como_orden_configurable() -> None:
+    config = remote()
+    assert config.allows_action("help") is True
+    assert "help" not in config.allows
+    # Sigue sin poder desactivarse: la lista vacia no la apaga.
+    apagado = remote(
+        allow_arm=False,
+        allow_disarm=False,
+        allow_status=False,
+        allow_silence=False,
+        allow_panic=False,
+    )
+    assert apagado.allows == ()
+    assert apagado.allows_action("help") is True
+
+
 def test_el_bloqueo_salta_al_llegar_al_limite_y_avisa_una_sola_vez() -> None:
     auth = authorizer(lockout_failures=3)
     assert not auth.evaluate("mala armar").locked_now

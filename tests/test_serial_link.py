@@ -135,3 +135,123 @@ def test_cerrar_limpia_el_estado(monkeypatch: pytest.MonkeyPatch) -> None:
     assert link.is_open is True
     link.close()
     assert link.is_open is False
+
+
+# ---------------------------------------------------------------------------
+# Deteccion de candidatos y rotacion tras un handshake fallido
+# ---------------------------------------------------------------------------
+
+
+class _Port:
+    """Lo unico que `list_candidates` mira de `list_ports.comports()`."""
+
+    def __init__(
+        self, device: str, vid: int | None, pid: int | None, description: str = ""
+    ) -> None:
+        self.device = device
+        self.vid = vid
+        self.pid = pid
+        self.description = description
+
+
+def test_el_fallback_descarta_puertos_sin_identidad(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Un puerto sin PID ni descripcion no es una placa y no debe elegirse.
+
+    Antes se aceptaba cualquier puerto con VID, asi que un adaptador virtual
+    podia quedar el primero y monopolizar la autodeteccion.
+    """
+    from serial.tools import list_ports
+
+    monkeypatch.setattr(
+        list_ports,
+        "comports",
+        lambda: [
+            _Port("COM1", None, None, ""),
+            _Port("COM3", 0x1234, None, "USB Serial"),
+            _Port("COM5", 0x1234, 0x5678, ""),
+            _Port("COM9", 0x1234, 0x5678, "USB Serial"),
+        ],
+    )
+    assert serial_link.list_candidates() == ["COM9"]
+
+
+def test_un_vid_conocido_se_prefiere_aunque_no_tenga_descripcion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from serial.tools import list_ports
+
+    monkeypatch.setattr(
+        list_ports,
+        "comports",
+        lambda: [
+            _Port("COM4", 0x1234, 0x5678, "USB Serial"),
+            _Port("COM7", 0x1A86, 0x7523, ""),
+        ],
+    )
+    assert serial_link.list_candidates() == ["COM7"]
+
+
+def test_un_puerto_descartado_se_salta_en_la_siguiente_apertura(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _instalar_serial(monkeypatch)
+    monkeypatch.setattr(serial_link, "list_candidates", lambda: ["COM1", "COM2"])
+
+    link = SerialLink()
+    link.open()
+    assert link.port == "COM1"
+
+    link.reject_current_port()
+    assert link.port is None
+    assert link.is_open is False
+
+    link.open()
+    assert link.port == "COM2"
+    assert FakeSerial.instances[-1].port == "COM2"
+
+
+def test_un_puerto_fijado_por_el_usuario_no_se_descarta(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Si el usuario eligio COM9, un fallo de saludo no lo cambia por otro."""
+    _instalar_serial(monkeypatch)
+    monkeypatch.setattr(SerialLink, "_port_available", staticmethod(lambda _port: True))
+    monkeypatch.setattr(serial_link, "list_candidates", lambda: ["COM1"])
+
+    link = SerialLink(port="COM9")
+    link.open()
+    link.reject_current_port()
+    assert link.port == "COM9"
+
+    link.open()
+    assert link.port == "COM9"
+    assert FakeSerial.instances[-1].port == "COM9"
+
+
+def test_el_enfriamiento_de_un_puerto_caduca(monkeypatch: pytest.MonkeyPatch) -> None:
+    _instalar_serial(monkeypatch)
+    monkeypatch.setattr(serial_link, "list_candidates", lambda: ["COM1"])
+
+    link = SerialLink()
+    link.open()
+    link.reject_current_port()
+    assert link.port is None
+
+    # El plazo ya paso: un fallo transitorio no puede dejar la placa perdida.
+    link._rejected["COM1"] = 0.0
+    link.open()
+    assert link.port == "COM1"
+
+
+def test_si_todos_los_candidatos_estan_descartados_el_error_lo_dice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _instalar_serial(monkeypatch)
+    monkeypatch.setattr(serial_link, "list_candidates", lambda: ["COM1"])
+
+    link = SerialLink()
+    link.open()
+    link.reject_current_port()
+
+    with pytest.raises(LinkError, match="no se detecto ninguna placa"):
+        link.open()

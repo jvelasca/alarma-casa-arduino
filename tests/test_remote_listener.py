@@ -228,6 +228,48 @@ def test_una_orden_desactivada_no_ejecuta_y_queda_registrada() -> None:
         listener.stop()
 
 
+def test_la_ayuda_se_atiende_sin_credencial_y_sin_alerta() -> None:
+    """El movil puede pedir ayuda aunque no lleve clave.
+
+    La orden no cambia nada y no revela estado, asi que el escucha la entrega
+    igual y no la cuenta como rechazo ni dispara el aviso de bloqueo.
+    """
+    events: list[tuple[str, str, str]] = []
+    stream = FakeStream([message("ayuda", identifier="h1")])
+    listener, _stream, _send, commands = make_listener(
+        stream,
+        on_event=lambda *args: events.append(args),  # type: ignore[arg-type]
+    )
+    listener.start()
+    try:
+        assert wait_for(lambda: len(commands) == 1)
+        assert commands[0].action == "help"
+        snapshot = listener.snapshot()
+        assert snapshot.accepted == 1
+        assert snapshot.rejected == 0
+        assert events == []
+    finally:
+        listener.stop()
+
+
+def test_la_ayuda_llega_aunque_el_mando_este_bloqueado() -> None:
+    stream = FakeStream([message("mala armar", identifier="1"), message("ayuda", identifier="2")])
+    listener, _stream, send, commands = make_listener(
+        stream, remote_config=remote(lockout_failures=1)
+    )
+    listener.start()
+    try:
+        assert wait_for(lambda: len(commands) == 1)
+        assert commands[0].action == "help"
+        # El bloqueo se anuncio una vez; la ayuda no genera otro aviso.
+        assert wait_for(lambda: bool(send.calls))
+        time.sleep(0.1)
+        assert [call for call in send.calls if "bloqueado" in call[1].lower()]
+        assert len(send.calls) == 1
+    finally:
+        listener.stop()
+
+
 # ---------------------------------------------------------------------------
 # Respuestas
 # ---------------------------------------------------------------------------

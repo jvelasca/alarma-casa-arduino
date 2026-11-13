@@ -15,6 +15,41 @@ sigue [Keep a Changelog](https://keepachangelog.com/es/1.1.0/) y la numeración
 
 - Zonas, panel web y bandeja del sistema (F2-F3 de la hoja de ruta).
 
+## [0.1.3] — 2026-11-13
+
+Cierre de los cinco hallazgos de prioridad alta y media de la auditoría externa
+(H-01 a H-05). No añade funcionalidades: cambia el orden en que se confirman los
+eventos, hace durable el estado de armado, acota el handshake y deja de gastar
+cuotas y credenciales donde no tocaba.
+
+### Corregido
+
+- **El evento se confirma después de procesarlo y guardarlo.** El ACK ya no lo
+  da el hilo lector al recibir: lo pide la ventana con `ack_events(seq)` tras
+  registrar la fila y aplicar la transición, y lo escribe el hilo lector. Si el
+  PC se cierra en ese hueco, el evento sigue en el buffer de la placa y se
+  recupera con `cmd replay` al reconectar. Los reenvíos se descartan por
+  `(boot, seq)` y se cuentan como duplicados.
+- **El estado de armado sobrevive al reinicio.** Nueva tabla `system_state` en
+  el historial y opción `alarm.restore_state_on_start` (activada por defecto).
+  Lo guardado manda sobre `armed_on_start`; al arrancar se registra «Estado
+  recuperado: ARMADA desde …» y el primer `hello` reenvía `armed=1`.
+- **La pantalla distingue estar armada de poder vigilar.** El hero muestra
+  `ARMADA · VIGILANCIA OPERATIVA`, `ARMADA · SENSOR CALENTÁNDOSE` o
+  `ARMADA · SENSOR NO DISPONIBLE` según saludo, calentamiento y salud del
+  enlace. El estado lógico armado no se toca para no abrir un hueco.
+- **Un puerto mudo ya no bloquea la autodetección.** Nueva opción
+  `serial.handshake_timeout_s` (3 s): si el puerto abre y no llega el saludo, se
+  cierra, se descarta dos minutos y se prueba el siguiente candidato. Un `COM`
+  fijado a mano se reintenta igual. El fallback de detección exige PID y
+  descripción.
+- **Descartar un aviso por cola llena ya no consume la cuota.** `Notifier.submit`
+  comprueba el hueco antes de pasar la compuerta y hace ambas cosas bajo un
+  cerrojo: un descarte no bloquea el siguiente aviso de la misma causa.
+- **`ayuda` responde sin credenciales.** Es la única orden que se acepta sin
+  clave ni TOTP, con todas las órdenes desactivadas y durante un bloqueo, y no
+  cuenta como intento fallido. No revela estado ni ejecuta nada.
+
 ## [0.1.2] — 2026-11-13
 
 Revisión previa a una auditoría externa: el firmware gana el watchdog que la
@@ -107,7 +142,8 @@ Mega como sensor y la aplicación de escritorio como central.
 - **Pruebas y calidad** — 501 pruebas de `pytest`, `ruff` y `mypy` en modo
   estricto, comprobados en integración continua.
 
-[Sin publicar]: https://github.com/jvelasca/alarma-casa-arduino/compare/v0.1.2...HEAD
+[Sin publicar]: https://github.com/jvelasca/alarma-casa-arduino/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/jvelasca/alarma-casa-arduino/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/jvelasca/alarma-casa-arduino/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/jvelasca/alarma-casa-arduino/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/jvelasca/alarma-casa-arduino/releases/tag/v0.1.0

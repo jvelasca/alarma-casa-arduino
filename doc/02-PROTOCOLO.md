@@ -238,10 +238,19 @@ emparejar peticion y respuesta.
 
 - **Secuencia.** El dispositivo numera los eventos. El PC los acusa con
   `ackevt` y el dispositivo los libera del buffer circular (16 posiciones).
+- **Acuse diferido.** `ackevt` no significa «recibido» sino «procesado»: la
+  ventana lo manda despues de aplicar el evento y guardarlo en SQLite, y es el
+  hilo lector quien escribe el numero en el puerto. Si el PC se cierra en ese
+  hueco, el evento sigue en el buffer de la placa.
+- **Replay.** Al recibir el primer `hello` de cada sesion, el PC pide
+  `cmd replay`: la placa reemite los eventos que siguen sin acusar. Los ya
+  procesados se descartan por `(boot, seq)` y se cuentan como duplicados.
 - **Desbordamiento.** Si el buffer se llena, se descarta el mas antiguo y se
   incrementa `lost`, que viaja en cada latido. Nunca se pierde en silencio.
-- **Reconexion.** Al abrir el puerto, el DTR reinicia la placa. El PC lo detecta
-  porque `boot` cambia, y resincroniza el contador de secuencia.
+- **Reconexion.** Al abrir el puerto, el DTR reinicia la placa y `seq` vuelve a
+  1, asi que el acuse se reinicia en cada apertura. El campo `boot` es
+  `millis()` en el arranque (practicamente 0) y no sirve como identidad de
+  sesion; el reinicio se reconoce por el propio cierre y reapertura del enlace.
 - **Lineas invalidas.** Se descartan y se cuentan en `stats.decode_errors`.
   Nunca detienen el bucle de lectura.
 - **Latido.** Si no llega ninguna linea durante `hb_timeout` (8 s por defecto),

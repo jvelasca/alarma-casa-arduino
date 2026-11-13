@@ -28,3 +28,12 @@ class Link(Protocol):
     def read_line(self, timeout: float) -> str | None: ...
 
     def write_line(self, text: str) -> None: ...
+
+    def reject_current_port(self) -> None:
+        """Descarta el puerto actual tras un handshake fallido.
+
+        El gestor lo llama cuando el enlace abre pero no llega ningun mensaje
+        valido en el plazo previsto. Un enlace simulado o un puerto fijado a
+        mano lo implementan como una operacion sin efecto.
+        """
+        ...

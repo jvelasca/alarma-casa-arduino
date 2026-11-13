@@ -119,6 +119,10 @@ class SimulatedLink:
             raise LinkError("enlace simulado cerrado")
         self._handle(text.strip())
 
+    def reject_current_port(self) -> None:
+        """No hay puertos que rotar: el enlace simulado siempre responde."""
+        return None
+
     # -- Reloj simulado ----------------------------------------------------
 
     def _now_s(self) -> float:

@@ -497,7 +497,7 @@ def test_armar_desarmar_desde_la_ventana(window) -> None:
     assert window._hero._state.text() == "DESARMADA"
 
     window.arm()
-    assert window._hero._state.text() == "ARMADA"
+    assert window._hero._state.text().startswith("ARMADA")
     assert window._controller.armed is True
     assert window._speech.spoken, "armar debe anunciarse por voz"
     assert "armada" in window._speech.spoken[0].lower()
@@ -527,6 +527,210 @@ def test_deteccion_desarmada_no_dispara(window) -> None:
     window._on_message(MotionEvent(seq=1, kind=MotionKind.START, zone=1, ms=1000))
     assert window._hero._state.text() == "DESARMADA"
     assert len(window._speech.spoken) == antes
+
+
+def test_el_evento_se_confirma_solo_despues_de_registrarlo(window) -> None:
+    """El ACK va al final: recibir no es lo mismo que haber procesado."""
+    from alarm.protocol.messages import MotionEvent, MotionKind
+
+    manager = FakeManager()
+    window._manager = manager
+    order: list[str] = []
+    original = window._log_event
+
+    def log_event(tag: str, kind: str, detail: str) -> None:
+        order.append("log")
+        original(tag, kind, detail)
+
+    window._log_event = log_event  # type: ignore[method-assign]
+    window.disarm()
+
+    window._on_message(MotionEvent(seq=7, kind=MotionKind.START, zone=1, ms=1000))
+    assert manager.acked == [7]
+    assert order == ["log"], "no se confirma antes de registrar"
+
+    # El fin del pulso tambien se confirma: si no, el buffer se llenaria.
+    window._on_message(MotionEvent(seq=8, kind=MotionKind.END, zone=1, ms=1200, dur_ms=200))
+    assert manager.acked == [7, 8]
+
+
+def test_sin_gestor_el_evento_no_revienta_la_ventana(window) -> None:
+    from alarm.protocol.messages import MotionEvent, MotionKind
+
+    window._manager = None
+    window.disarm()
+    window._on_message(MotionEvent(seq=1, kind=MotionKind.START, zone=1, ms=1000))
+    assert window._hero._state.text() == "DESARMADA"
+
+
+# ---------------------------------------------------------------------------
+# Estado operativo persistente (H-02)
+# ---------------------------------------------------------------------------
+
+
+def _ventana_con_estado(tmp_path, *, armed: str | None, **alarm_overrides: object):
+    """Ventana nueva sobre una base ya sembrada con `armed_intent`."""
+    from alarm.services.storage import EventStore
+    from alarm.ui.app import MainWindow
+
+    path = tmp_path / "alarm.db"
+    store = EventStore(path)
+    if armed is not None:
+        store.set_state("armed_intent", armed)
+        store.set_state("armed_at", "1700000000")
+    store.close()
+
+    base = default_config()
+    overrides: dict[str, object] = {"exit_delay_s": 0, "entry_delay_s": 0}
+    overrides.update(alarm_overrides)
+    instance = MainWindow(
+        simulated=True,
+        autoconnect=False,
+        config=replace(base, alarm=replace(base.alarm, **overrides)),  # type: ignore[arg-type]
+        config_path=tmp_path / "alarm.toml",
+        local_path=tmp_path / "alarm.local.toml",
+        env_path=tmp_path / ".env",
+        history_path=path,
+    )
+    instance._speech = FakeSpeech()  # type: ignore[assignment]
+    instance._notifier = FakeNotifier()  # type: ignore[assignment]
+    return instance
+
+
+def test_una_base_armada_restaura_armada(tmp_path) -> None:
+    from alarm.core.state import AlarmState
+
+    instance = _ventana_con_estado(tmp_path, armed="true")
+    try:
+        assert instance._controller.state is AlarmState.ARMED
+        assert instance._hero._state.text().startswith("ARMADA")
+        # La fila deja dicho de donde viene el estado.
+        details = [row.detail for row in instance._store.recent(20)]
+        assert any("Estado recuperado: ARMADA" in detail for detail in details)
+    finally:
+        instance.shutdown()
+        instance.deleteLater()
+
+
+def test_el_estado_guardado_manda_sobre_armed_on_start(tmp_path) -> None:
+    """`armed_on_start=false` no puede desarmar lo que estaba armado."""
+    from alarm.core.state import AlarmState
+
+    instance = _ventana_con_estado(tmp_path, armed="true", armed_on_start=False)
+    try:
+        assert instance._controller.state is AlarmState.ARMED
+    finally:
+        instance.shutdown()
+        instance.deleteLater()
+
+
+def test_sin_estado_guardado_se_usa_armed_on_start(tmp_path) -> None:
+    from alarm.core.state import AlarmState
+
+    instance = _ventana_con_estado(tmp_path, armed=None, armed_on_start=True)
+    try:
+        assert instance._controller.state is AlarmState.ARMED
+    finally:
+        instance.shutdown()
+        instance.deleteLater()
+
+
+def test_arrancar_con_restore_desactivado_ignora_la_base(tmp_path) -> None:
+    from alarm.core.state import AlarmState
+
+    instance = _ventana_con_estado(
+        tmp_path, armed="true", armed_on_start=False, restore_state_on_start=False
+    )
+    try:
+        assert instance._controller.state is AlarmState.DISARMED
+    finally:
+        instance.shutdown()
+        instance.deleteLater()
+
+
+def test_desarmar_persiste_el_estado(tmp_path) -> None:
+    instance = _ventana_con_estado(tmp_path, armed="true")
+    try:
+        instance.disarm()
+        assert instance._store.get_state("armed_intent") == "false"
+        assert instance._store.get_state("armed_at") is None
+    finally:
+        instance.shutdown()
+        instance.deleteLater()
+
+
+def test_armar_persiste_el_estado(tmp_path) -> None:
+    instance = _ventana_con_estado(tmp_path, armed="false")
+    try:
+        instance.arm()
+        assert instance._store.get_state("armed_intent") == "true"
+        assert instance._store.get_state("armed_at") is not None
+    finally:
+        instance.shutdown()
+        instance.deleteLater()
+
+
+def test_una_base_ilegible_degrada_a_armed_on_start(tmp_path) -> None:
+    from alarm.core.state import AlarmState
+
+    path = tmp_path / "alarm.db"
+    path.write_bytes(b"esto no es una base sqlite")
+    from alarm.ui.app import MainWindow
+
+    base = default_config()
+    instance = MainWindow(
+        simulated=True,
+        autoconnect=False,
+        config=replace(
+            base,
+            alarm=replace(base.alarm, armed_on_start=True, exit_delay_s=0, entry_delay_s=0),
+        ),
+        config_path=tmp_path / "alarm.toml",
+        local_path=tmp_path / "alarm.local.toml",
+        env_path=tmp_path / ".env",
+        history_path=path,
+    )
+    instance._speech = FakeSpeech()  # type: ignore[assignment]
+    instance._notifier = FakeNotifier()  # type: ignore[assignment]
+    try:
+        assert instance._controller.state is AlarmState.ARMED
+        assert instance._store_error, "la ventana debe seguir diciendo que no hay historial"
+    finally:
+        instance.shutdown()
+        instance.deleteLater()
+
+
+def test_la_etiqueta_distingue_calentando_de_vigilancia(window) -> None:
+    """Nunca se anuncia «vigilancia operativa» sin saludo y calentamiento."""
+    from alarm.protocol.messages import Health, Hello, Ready, Zone
+
+    hello = Hello(
+        proto=1,
+        dev="Arduino Mega 2560",
+        fw="1.0",
+        boot_ms=0,
+        zones=(Zone(id=1, name="PIR", pin=2),),
+        caps=("pir",),
+    )
+    window.arm()
+    assert window._hero._state.text() == "ARMADA · SENSOR NO DISPONIBLE"
+
+    manager = FakeManager(health=Health.ONLINE)
+    manager.hello = hello  # type: ignore[attr-defined]
+    window._manager = manager
+    window._last_health = Health.ONLINE
+    window._start_warmup(60_000)
+    window._paint_alarm()
+    assert window._hero._state.text() == "ARMADA · SENSOR CALENTÁNDOSE"
+
+    window._on_message(Ready(warmup_ms=0))
+    window._paint_alarm()
+    assert window._hero._state.text() == "ARMADA · VIGILANCIA OPERATIVA"
+
+    # Al caer el enlace vuelve a decir la verdad, sin desarmar.
+    window._last_health = Health.OFFLINE
+    window._paint_alarm()
+    assert window._hero._state.text() == "ARMADA · SENSOR NO DISPONIBLE"
 
 
 def test_armar_encola_el_aviso(window, qapp) -> None:
@@ -559,7 +763,8 @@ def test_la_etiqueta_de_estado_es_configurable(window) -> None:
     labels["armed"] = "EN GUARDIA"
     window._apply_config(replace(window._config, ui=replace(window._config.ui, labels=labels)))
     window.arm()
-    assert window._hero._state.text() == "EN GUARDIA"
+    # La etiqueta configurable manda; el sufijo de disponibilidad se anade.
+    assert window._hero._state.text().startswith("EN GUARDIA")
 
 
 # ---------------------------------------------------------------------------
@@ -986,16 +1191,21 @@ class FakeManager:
 
         self.ever_online = ever_online
         self.health = Health.OFFLINE if health is None else health
+        self.hello = None
         self.alive = alive
         self.stats = SimpleNamespace(last_error=error)
         self.next_retry_in = 7.0
         self.heartbeat_age_s = 26.0
         self.link = None
         self.sent: list[tuple[str, dict[str, object]]] = []
+        self.acked: list[int] = []
 
     def send(self, op: str, **params: object) -> int:
         self.sent.append((op, params))
         return 1
+
+    def ack_events(self, seq: int) -> None:
+        self.acked.append(seq)
 
     def stop(self, timeout: float = 3.0) -> None:
         pass
@@ -1874,7 +2084,7 @@ def test_el_retardo_de_salida_pita_y_anuncia_al_terminar(window) -> None:
 
     now[0] = 20.0
     window._tick_delays()
-    assert window._hero._state.text() == "ARMADA"
+    assert window._hero._state.text().startswith("ARMADA")
     assert window._speech.spoken, "al vencer el retardo sí se anuncia"
     assert ("beep", {"name": "armed", "ms": 0, "force": 0}) in window._manager.sent
 
@@ -1908,7 +2118,7 @@ def test_el_reloj_solo_aparece_con_un_retardo_en_curso(window) -> None:
 
     now[0] = 90.0
     window._tick_delays()
-    assert window._hero._state.text() == "ARMADA"
+    assert window._hero._state.text().startswith("ARMADA")
     assert not window._hero._clock.isVisibleTo(window), "al armarse el reloj se retira"
 
 
@@ -1933,7 +2143,7 @@ def test_el_retardo_de_entrada_permite_desarmar(window) -> None:
     window._manager = FakeManager()
     now = _reloj(window, entry_s=15)
     window.arm()
-    assert window._hero._state.text() == "ARMADA"
+    assert window._hero._state.text().startswith("ARMADA")
 
     window._on_message(MotionEvent(seq=1, kind=MotionKind.START, zone=1, ms=1000))
     assert window._hero._state.text() == "ENTRADA"
@@ -2107,7 +2317,7 @@ def test_el_rearme_devuelve_la_alarma_a_armada(window) -> None:
     now[0] = 15.0
     window._tick_delays()
 
-    assert window._hero._state.text() == "ARMADA"
+    assert window._hero._state.text().startswith("ARMADA")
     assert not window._hero._clock.isVisibleTo(window)
     assert ("beep", {"name": "armed", "ms": 0, "force": 0}) in window._manager.sent
     assert len(window._speech.spoken) == ahora + 1, "se anuncia el rearme por voz"
@@ -2128,7 +2338,7 @@ def test_el_rearme_agotado_avisa_y_no_vuelve_a_armar(window) -> None:
     window._tick_delays()
     now[0] = 15.0
     window._tick_delays()
-    assert window._hero._state.text() == "ARMADA"
+    assert window._hero._state.text().startswith("ARMADA")
     assert window._controller.rearm_count == 1
 
     window._on_message(MotionEvent(seq=2, kind=MotionKind.START, zone=1, ms=2000))
@@ -2455,6 +2665,28 @@ def test_ayuda_no_revela_la_clave(window) -> None:
     assert title == "[Mando] Ayuda"
     assert "armar" in text and "desarmar" in text
     assert "clave-de-prueba-1234" not in text
+
+
+def test_ayuda_responde_aunque_todo_lo_demas_este_desactivado(window) -> None:
+    from alarm.services.ntfy_commands import RemoteCommand
+
+    listener = FakeRemoteListener()
+    window._remote_listener = listener
+    window._apply_config(
+        _remote_config(
+            allow_arm=False,
+            allow_disarm=False,
+            allow_status=False,
+            allow_silence=False,
+            allow_panic=False,
+        )
+    )
+
+    window._on_remote_command(RemoteCommand(action="help", text="ayuda"))
+
+    title, text, _priority, _tags = listener.replies[-1]
+    assert title == "[Mando] Ayuda"
+    assert "armar" in text
 
 
 def test_el_panico_dispara_y_no_lo_calla_el_enfriamiento(window) -> None:

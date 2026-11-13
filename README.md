@@ -181,6 +181,10 @@ clave-7f3k9x desarmar
 puntuación; la clave puede ir antes o después. Cada orden aceptada contesta con
 `[Mando] …` y deja fila en el historial.
 
+`ayuda` es la única orden que no pide clave ni TOTP, se responde aunque el resto
+esté desactivado y funciona con el mando bloqueado: solo lista las órdenes y un
+ejemplo, sin revelar el estado de la casa.
+
 En lugar de una clave se puede activar un **código TOTP** de 6 dígitos (Google
 Authenticator, Authy…): con TOTP activo la clave deja de valer. Tras cinco
 fallos, el mando se bloquea quince minutos y avisa una sola vez.

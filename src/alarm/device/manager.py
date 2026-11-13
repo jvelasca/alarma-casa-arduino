@@ -34,12 +34,15 @@ class Stats:
     events_rx: int = 0
     reboots: int = 0
     reconnects: int = 0
+    handshake_timeouts: int = 0
+    duplicates: int = 0
     last_error: str = ""
 
     def describe(self) -> str:
         return (
             f"lineas={self.lines_rx} errores={self.decode_errors} "
-            f"eventos={self.events_rx} reconexiones={self.reconnects}"
+            f"eventos={self.events_rx} reconexiones={self.reconnects} "
+            f"sin_saludo={self.handshake_timeouts} duplicados={self.duplicates}"
         )
 
 
@@ -65,6 +68,7 @@ class DeviceManager:
         auto_ack: bool = True,
         hb_ms: int = 2000,
         hb_timeout_s: float | None = None,
+        handshake_timeout_s: float = 3.0,
         reconnect_max_s: float = 30.0,
         on_message: MessageHandler | None = None,
         on_health: HealthHandler | None = None,
@@ -75,6 +79,10 @@ class DeviceManager:
         self._hb_timeout = (
             hb_timeout_s if hb_timeout_s is not None else max(6.0, hb_ms * 4 / 1000.0)
         )
+        # Plazo propio del saludo. El watchdog de datos solo existe despues del
+        # primer mensaje valido: sin este, un puerto que abre pero no contesta
+        # (otro USB serie, un adaptador ajeno) se quedaba elegido para siempre.
+        self._handshake_timeout = max(0.5, float(handshake_timeout_s))
         self._reconnect_max = reconnect_max_s
 
         self.on_message = on_message
@@ -90,6 +98,12 @@ class DeviceManager:
         self._next_id = 1
         self._pending: dict[int, _Pending] = {}
         self._opened_once = False
+        # Acuse acumulativo pendiente de escribir. `ack_events` lo apunta desde
+        # el hilo que consume (Qt) y el hilo lector lo escribe: la interfaz no
+        # toca el puerto y el ACK sale en la siguiente vuelta del bucle.
+        self._ack_target = 0
+        self._ack_dirty = False
+        self._replay_pending = False
 
         self._last_hb: float | None = None
         self._last_rx: float | None = None
@@ -98,6 +112,12 @@ class DeviceManager:
         self._connected = threading.Event()
         self._ever_online = False
         self._next_retry_at: float | None = None
+        # Instante de la apertura en curso y si ya llego algo valido desde
+        # entonces. Ambos se reinician en cada apertura: el plazo del saludo
+        # se cuenta por sesion, no desde que arranco el programa.
+        self._opened_at: float | None = None
+        self._session_hello = False
+        self._replay_done = False
 
     # -- Ciclo de vida -----------------------------------------------------
 
@@ -116,6 +136,7 @@ class DeviceManager:
         with suppress(Exception):
             self._link.close()
         self._next_retry_at = None
+        self._opened_at = None
         # Una parada pedida por el usuario no es una averia: se vuelve a
         # UNKNOWN sin avisar a la interfaz de una transicion a OFFLINE.
         self._health = Health.UNKNOWN
@@ -236,10 +257,22 @@ class DeviceManager:
         return self.hello
 
     def ack_events(self, seq: int) -> None:
-        if seq <= self.last_seq_acked:
+        """Confirma eventos hasta ``seq``. Seguro desde cualquier hilo.
+
+        El ACK solo debe llegar cuando el consumidor ha procesado el evento
+        (la ventana lo hace despues de persistirlo). Aqui solo se apunta el
+        numero: escribirlo es cosa del hilo lector, asi la interfaz no toca el
+        puerto y dos hilos no se pisan el mismo enlace.
+        """
+        if seq <= 0:
             return
-        self.last_seq_acked = seq
-        self._link.write_line(encode_ack_events(seq))
+        with self._lock:
+            if seq <= self.last_seq_acked:
+                return
+            # Monotono y acumulativo: confirmar N confirma todo lo anterior.
+            self.last_seq_acked = seq
+            self._ack_target = seq
+            self._ack_dirty = True
 
     # -- Bucle interno -----------------------------------------------------
 
@@ -249,11 +282,28 @@ class DeviceManager:
             try:
                 if not self._link.is_open:
                     self._link.open()
+                    self._opened_at = time.monotonic()
+                    self._session_hello = False
+                    self._replay_done = False
+                    # Cada apertura es una sesion nueva. El firmware numera sus
+                    # eventos desde cero tras un reinicio (que es lo que provoca
+                    # abrir el puerto por DTR), asi que conservar el acuse viejo
+                    # descartaria los primeros eventos de la placa. Su `boot` es
+                    # casi siempre 0, de modo que no sirve para distinguirlo.
+                    with self._lock:
+                        self.last_seq_acked = 0
+                        self._ack_target = 0
+                        self._ack_dirty = False
                     backoff = 1.0
                     if self._opened_once:
                         self.stats.reconnects += 1
                     self._opened_once = True
                     self.send("hello")
+                # Los acuses y el `replay` salen de este hilo y antes de leer:
+                # la interfaz solo deja apuntado lo que ya proceso. Escribirlos
+                # despues de `read_line` podria perder la linea recien leida si
+                # el enlace falla justo al confirmar.
+                self._flush_control()
                 line = self._link.read_line(0.25)
             except LinkError as exc:
                 self.stats.last_error = str(exc)
@@ -274,6 +324,11 @@ class DeviceManager:
                 continue
 
             if line is None:
+                if self._check_handshake():
+                    if self._wait_retry(backoff):
+                        break
+                    backoff = min(backoff * 2, self._reconnect_max)
+                    continue
                 self._check_timeout()
                 continue
 
@@ -287,6 +342,26 @@ class DeviceManager:
 
             self._dispatch(message)
 
+    def _flush_control(self) -> None:
+        """Escribe el ACK pendiente y, si toca, pide el `replay`."""
+        with self._lock:
+            ack = self._ack_target if self._ack_dirty else 0
+            replay = self._replay_pending
+            self._replay_pending = False
+        if ack:
+            # Solo se marca limpio si no aparecio otro ACK mientras se escribia.
+            self._link.write_line(encode_ack_events(ack))
+            with self._lock:
+                if self._ack_target == ack:
+                    self._ack_dirty = False
+        if replay:
+            # Los eventos que la placa no habia confirmado se reenvian ahora;
+            # los ya procesados se descartan por `last_seq_acked`.
+            with self._lock:
+                cmd_id = self._next_id
+                self._next_id += 1
+            self._link.write_line(encode_cmd(cmd_id, "replay"))
+
     def _wait_retry(self, delay: float) -> bool:
         """Espera antes del proximo intento y publica la cuenta atras.
 
@@ -297,6 +372,34 @@ class DeviceManager:
             return self._stop.wait(delay)
         finally:
             self._next_retry_at = None
+
+    def _check_handshake(self) -> bool:
+        """Descarta la sesion si el puerto abrio pero no llego el saludo.
+
+        Devuelve True cuando toca reintentar con otro candidato. El watchdog
+        normal no cubre este caso: solo actua despues del primer mensaje
+        valido, y aqui el problema es justo que no llega ninguno. Sin este
+        plazo, elegir un USB serie ajeno dejaba el enlace esperando para
+        siempre, sin equivocarse a la vista.
+        """
+        if self._opened_at is None or self._session_hello:
+            return False
+        if time.monotonic() - self._opened_at < self._handshake_timeout:
+            return False
+        name = self._link.name
+        self.stats.handshake_timeouts += 1
+        self.stats.last_error = (
+            f"sin respuesta al saludo en {name} ({self._handshake_timeout:.0f} s)"
+        )
+        log.warning(
+            "%s abrio pero no respondio al saludo en %.0f s: se descarta",
+            name,
+            self._handshake_timeout,
+        )
+        self._safe_close()
+        with suppress(Exception):
+            self._link.reject_current_port()
+        return True
 
     def _check_timeout(self) -> None:
         if self._last_rx is None:
@@ -312,6 +415,7 @@ class DeviceManager:
     def _safe_close(self) -> None:
         with suppress(Exception):
             self._link.close()
+        self._opened_at = None
         self._connected.clear()
 
     def _dispatch(self, message: Message) -> None:
@@ -323,18 +427,38 @@ class DeviceManager:
         if isinstance(message, Hello):
             # Un `hello` repetido es normal (lo pide el PC para resincronizar).
             # Solo es un reinicio real si cambio el instante de arranque.
-            if self.hello is not None and message.boot_ms != self.hello.boot_ms:
+            self._session_hello = True
+            rebooted = self.hello is not None and message.boot_ms != self.hello.boot_ms
+            if rebooted:
                 self.stats.reboots += 1
-                self.last_seq_acked = 0
+                # La placa vuelve a numerar sus eventos desde cero: conservar el
+                # acuse anterior descartaria los primeros de la sesion nueva.
+                with self._lock:
+                    self.last_seq_acked = 0
+                    self._ack_target = 0
+                    self._ack_dirty = False
                 log.info("dispositivo reiniciado (boot=%d ms)", message.boot_ms)
             self.hello = message
             self._last_hb = time.monotonic()
             self._connected.set()
+            # Lo que la placa no llego a confirmar (porque el PC se cerro o el
+            # cable se cayo) sigue en su buffer: se pide una vez por sesion.
+            with self._lock:
+                if not self._replay_done:
+                    self._replay_done = True
+                    self._replay_pending = True
         elif isinstance(message, Heartbeat):
             self._last_hb = time.monotonic()
         elif isinstance(message, MotionEvent):
             self.stats.events_rx += 1
-            if self._auto_ack and message.seq > self.last_seq_acked:
+            with self._lock:
+                already = message.seq <= self.last_seq_acked
+            if already:
+                # Reenvio de un evento ya procesado y confirmado. Se cuenta y
+                # no se entrega: el consumidor no debe registrar dos veces.
+                self.stats.duplicates += 1
+                return
+            if self._auto_ack:
                 self.ack_events(message.seq)
         elif isinstance(message, CommandAck):
             with self._lock:

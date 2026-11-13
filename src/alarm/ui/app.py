@@ -268,6 +268,9 @@ class MainWindow(QMainWindow):
         self._events = 0
         self._pulses = 0
         self._level = False
+        # Filas que no se pudieron guardar en SQLite. Se confirman igualmente
+        # para no llenar el buffer de la placa; el contador lo dice en pantalla.
+        self._store_failures = 0
 
         # Estado del enlace, para no repetir avisos en cada refresco.
         self._link_down = False
@@ -291,8 +294,17 @@ class MainWindow(QMainWindow):
         self._remote_listener: CommandListener | None = None
 
         self._config = config if config is not None else default_config()
+
+        # El almacen se abre antes de crear el controlador: si la aplicacion se
+        # cerro armada, ese estado manda sobre `armed_on_start`. Crear primero
+        # el controlador obligaba a arrancar desarmada y rearmar despues, con
+        # el hueco de desproteccion que eso deja.
+        self._store = self._open_store(history_path)
+        self._restored_armed_at: float | None = None
+        armed_on_start = self._resolve_armed_on_start()
+
         self._controller = AlarmController(
-            armed_on_start=self._config.alarm.armed_on_start,
+            armed_on_start=armed_on_start,
             cooldown_s=self._config.alarm.cooldown_s,
             max_per_hour=self._config.alarm.max_per_hour,
             exit_delay_s=self._config.alarm.exit_delay_s,
@@ -302,6 +314,13 @@ class MainWindow(QMainWindow):
             max_rearms=self._config.alarm.max_rearms,
             siren_s=self._config.buzzer.siren_ms / 1000,
         )
+        # Se guarda el estado efectivo ya al arrancar, para que la proxima
+        # apertura no dependa de que este sea el primer armado.
+        self._persisted_armed: bool | None = None
+        self._persist_armed_state()
+        # Ultimo sufijo de disponibilidad pintado, para no repintar el hero en
+        # cada refresco de 500 ms cuando no cambia nada.
+        self._availability = ""
         self._speech = SpeechService(self._config.tts)
         self._email = EmailChannel(self._config.email)
         self._sms = build_sms_channel(self._config.sms, self._email)
@@ -330,8 +349,6 @@ class MainWindow(QMainWindow):
         # contadores. Se mide con la hoja de estilos aplicada (fuente incluida).
         self.setMinimumSize(880, 750)
 
-        self._store = self._open_store(history_path)
-
         self._build_actions()
         self._build_menus()
         self._build_toolbar()
@@ -344,6 +361,13 @@ class MainWindow(QMainWindow):
         set_enabled(self._config.ui.beeps)
         self._log.set_limit(self._config.log.visible_rows)
         self._load_history()
+        if self._restored_armed_at is not None:
+            when = time.strftime("%d/%m/%Y %H:%M", time.localtime(self._restored_armed_at))
+            # La fila deja constancia de que la alarma no arranco desarmada:
+            # quien lea el historial no debe pensar que el estado es de fabrica.
+            self._log_event(
+                "warning", "Estado recuperado", f"Estado recuperado: ARMADA desde {when}"
+            )
         if self._store_error:
             self._log_event(
                 "error", "Historial", f"no se pudo abrir la base de datos: {self._store_error}"
@@ -1101,6 +1125,28 @@ class MainWindow(QMainWindow):
             hint = f"{hint} {_LINK_DOWN_HINT}".strip()
         return hint
 
+    def _sensor_ready(self) -> bool:
+        """Hay un sensor vigilando de verdad, no solo un estado armado.
+
+        Hace falta gestor, saludo recibido, calentamiento terminado y enlace con
+        datos. Es lo que permite afirmar «vigilancia operativa» sin mentir.
+        """
+        manager = self._manager
+        return bool(
+            manager is not None
+            and manager.hello is not None
+            and self._warmup_total_ms == 0
+            and self._last_health in (Health.ONLINE, Health.DEGRADED)
+        )
+
+    def _availability_suffix(self) -> str:
+        """Sufijo del estado ARMADA: operativa, calentando o sin sensor."""
+        if self._warmup_total_ms > 0:
+            return "SENSOR CALENTÁNDOSE"
+        if not self._sensor_ready():
+            return "SENSOR NO DISPONIBLE"
+        return "VIGILANCIA OPERATIVA"
+
     def _update_clock(self) -> None:
         """Pinta o esconde el reloj grande del retardo en curso.
 
@@ -1124,6 +1170,11 @@ class MainWindow(QMainWindow):
     def _paint_alarm(self) -> None:
         key = self._state_key()
         text = self._config.ui.label(key)
+        if key == "armed":
+            # El estado logico sigue siendo ARMADA aunque el sensor no este
+            # disponible: no se desarma para no abrir un hueco. Pero la
+            # pantalla no puede decir «vigilando» si no hay quien vigile.
+            text = f"{text} · {self._availability_suffix()}"
         hint = self._state_hint(key)
         self._hero.set_state(key, text, hint, silenced=self._controller.silenced)
         self._update_clock()
@@ -1364,8 +1415,13 @@ class MainWindow(QMainWindow):
         self._link_name = link.name
         manager = DeviceManager(
             link,
-            auto_ack=True,
+            # El ACK lo da la ventana despues de procesar y guardar el evento.
+            # Confirmarlo aqui (en el hilo lector) permitia que el firmware lo
+            # borrase antes de que Qt lo entregara: un cierre en ese hueco
+            # perdia el movimiento sin rastro.
+            auto_ack=False,
             hb_timeout_s=self._config.serial.heartbeat_timeout_s,
+            handshake_timeout_s=self._config.serial.handshake_timeout_s,
             reconnect_max_s=self._config.serial.reconnect_max_s,
             on_message=self._bridge.push_message,
             on_health=self._bridge.push_health,
@@ -1494,6 +1550,8 @@ class MainWindow(QMainWindow):
         # El estado del dispositivo se sincroniza siempre, tambien al silenciar:
         # asi el zumbador local deja de pitar aunque el USB vaya con retraso.
         self._sync_device_armed()
+        # Y el estado logico se persiste para que un reinicio no desarme nada.
+        self._persist_armed_state()
 
         hour = time.strftime("%H:%M:%S")
         if transition.action == ACTION_ARMING:
@@ -2429,9 +2487,29 @@ class MainWindow(QMainWindow):
                 self._log_event("end", "Fin de pulso", f"duración {duration}")
             else:
                 self._log_event("bounce", "Rebote", "Flanco descartado por antirrebote")
+            # Solo ahora, con el evento ya procesado, registrado y con la
+            # maquina de estados al dia, puede el firmware borrarlo. Si se
+            # confirmara al recibirlo, un cierre en este hueco perderia el
+            # movimiento sin dejar ni rastro.
+            self._ack_event(message)
 
         elif isinstance(message, DeviceError):
             self._log_event("error", "Error", f"{message.code}: {message.msg}")
+
+    def _ack_event(self, message: MotionEvent) -> None:
+        """Confirma el evento a la placa despues de haberlo procesado.
+
+        El gestor solo apunta el numero; el hilo lector lo escribe. Si el
+        enlace se esta cayendo no se pierde nada: el firmware lo reenviara al
+        reconectar y el gestor descartara el duplicado.
+        """
+        manager = self._manager
+        if manager is None:
+            return
+        try:
+            manager.ack_events(message.seq)
+        except Exception:  # noqa: BLE001 - un ACK no puede tumbar la interfaz
+            log.debug("no se pudo confirmar el evento %d", message.seq, exc_info=True)
 
     # ------------------------------------------------------------------
     # Salud del enlace
@@ -2500,6 +2578,65 @@ class MainWindow(QMainWindow):
     # Registro
     # ------------------------------------------------------------------
 
+    def _resolve_armed_on_start(self) -> bool:
+        """Con que estado nace el controlador.
+
+        Orden: lo guardado (si `restore_state_on_start`) y, si no hay nada, el
+        valor de configuracion. Nunca lanza: una base ilegible degrada a
+        `armed_on_start` en vez de impedir arrancar.
+        """
+        if not self._config.alarm.restore_state_on_start:
+            return self._config.alarm.armed_on_start
+        try:
+            value = self._store.get_state("armed_intent")
+        except Exception:  # noqa: BLE001 - el arranque no depende del historial
+            log.exception("no se pudo leer el estado guardado")
+            return self._config.alarm.armed_on_start
+        if value is None:
+            return self._config.alarm.armed_on_start
+        armed = value.strip().lower()
+        if armed not in ("true", "false"):
+            log.warning("estado guardado ilegible (%r): se usa armed_on_start", value)
+            return self._config.alarm.armed_on_start
+        if armed == "true":
+            self._restored_armed_at = self._read_armed_at()
+            log.info("se recupera el estado ARMADA guardado")
+        return armed == "true"
+
+    def _read_armed_at(self) -> float | None:
+        try:
+            raw = self._store.get_state("armed_at")
+            return None if raw is None else float(raw)
+        except (TypeError, ValueError):
+            return None
+        except Exception:  # noqa: BLE001
+            log.exception("no se pudo leer la hora del armado")
+            return None
+
+    def _persist_armed_state(self) -> None:
+        """Guarda la intencion de armado para sobrevivir al reinicio.
+
+        Se llama en cada transicion, pero solo escribe cuando el estado logico
+        cambia de armada a desarmada o al reves: los retardos y los disparos no
+        tocan el disco.
+        """
+        armed = self._controller.armed
+        if armed == self._persisted_armed:
+            return
+        self._persisted_armed = armed
+        try:
+            self._store.set_state("armed_intent", "true" if armed else "false")
+            if armed:
+                # Se conserva la hora del primer armado: si se viene de una
+                # recuperacion, la fila «ARMADA desde …» no debe saltar a la
+                # hora del ultimo reinicio.
+                if self._store.get_state("armed_at") is None:
+                    self._store.set_state("armed_at", f"{time.time():.0f}")
+            else:
+                self._store.clear_state("armed_at")
+        except Exception:  # noqa: BLE001 - no puede tumbar la alarma
+            log.exception("no se pudo guardar el estado de armado")
+
     def _open_store(self, path: Path | str | None) -> EventStore:
         """Abre el historial; si el disco falla, se sigue en memoria."""
         cfg = self._config.log
@@ -2538,8 +2675,14 @@ class MainWindow(QMainWindow):
             row = self._store.append(tag, kind, detail)
         except Exception as exc:  # noqa: BLE001 - el registro no tumba la app
             log.exception("no se pudo guardar el evento")
+            self._store_failures += 1
             self._log.add_row(tag, kind, detail)
             self._log.add_row("error", "Historial", f"no se pudo guardar en disco: {exc}")
+            # El evento se confirma igualmente: bloquear el ACK llenaria el
+            # buffer de 16 de la placa y perderia los siguientes. Queda dicho
+            # en pantalla que esta fila no sobrevivira al cierre.
+            if self._store_failures == 1:
+                self._status("Aviso: el historial no se está guardando en disco.")
             return
         self._log.add_row(tag, kind, detail, ts=row.ts)
         self._refresh_log_footer()
@@ -2836,6 +2979,12 @@ class MainWindow(QMainWindow):
         # que lleva 60 s escuchando aunque no haya pasado nadie.
         self._sensor.tick()
         self._paint_warmup()
+        # El sufijo de ARMADA cambia al llegar el saludo, al terminar el
+        # calentamiento o al caer el enlace; se repinta solo cuando cambia.
+        availability = self._availability_suffix() if self._state_key() == "armed" else ""
+        if availability != self._availability:
+            self._availability = availability
+            self._paint_alarm()
         if health is Health.OFFLINE and manager.stats.last_error:
             self._status(f"Sin enlace: {manager.stats.last_error}")
 

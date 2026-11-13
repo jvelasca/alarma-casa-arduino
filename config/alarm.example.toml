@@ -23,10 +23,20 @@ reconnect_max_s = 30
 # Segundos sin recibir una linea antes de dar el enlace por perdido. El
 # firmware late cada 2 s: 8 s son cuatro latidos perdidos.
 heartbeat_timeout_s = 8
+# Plazo para el primer mensaje de la placa tras abrir el puerto. Si no llega,
+# ese puerto no era la placa: se cierra y se prueba el siguiente candidato.
+# Evita quedarse esperando en otro dispositivo USB serie.
+handshake_timeout_s = 3
 
 [alarm]
-# Si es true, la alarma queda armada al arrancar la aplicacion.
+# Si es true, la alarma queda armada al arrancar la aplicacion. Solo se usa
+# cuando no hay un estado guardado; con `restore_state_on_start` el estado
+# real de la ultima sesion manda.
 armed_on_start = false
+# Recuperar al arrancar el estado en que quedo la alarma (armada o desarmada).
+# Evita que un reinicio deje la casa sin vigilar. Ponlo a false para volver a
+# decidir siempre con `armed_on_start`.
+restore_state_on_start = true
 # Minimo entre dos avisos de la misma causa.
 cooldown_s = 180
 # Tope de avisos por hora, para no inundar el movil.

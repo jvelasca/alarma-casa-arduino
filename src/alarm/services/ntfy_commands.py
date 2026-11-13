@@ -33,7 +33,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
-from ..config import NtfyConfig, RemoteConfig, valid_ntfy_topic
+from ..config import PUBLIC_ACTIONS, NtfyConfig, RemoteConfig, valid_ntfy_topic
 from .base import DeliveryResult, sanitize
 from .ntfy_sender import publish
 from .totp import STEP_S, verify_code
@@ -206,6 +206,13 @@ class CommandAuthorizer:
         if found is None:
             return Verdict(reason="no parece una orden")
         index, action, verb = found
+
+        # La ayuda no cambia nada ni cuenta datos de la casa: se responde
+        # siempre, sin credencial, sin mirar los permisos y aunque el mando
+        # este bloqueado por intentos fallidos. Si exigiera clave, el bloqueo
+        # dejaria al usuario sin la unica orden que le explica que hacer.
+        if action in PUBLIC_ACTIONS:
+            return Verdict(action=action, accepted=True, verb=verb)
 
         if not self._remote.allows_action(action):
             return Verdict(action=action, reason="esa orden está desactivada", verb=verb)
