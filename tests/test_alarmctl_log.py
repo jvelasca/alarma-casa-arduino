@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from _entorno import entorno_utf8
 from alarm.services.storage import EventStore
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +42,7 @@ def _run(*args: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         encoding="utf-8",
+        env=entorno_utf8(),
         cwd=ROOT,
         timeout=60,
     )
@@ -109,3 +111,27 @@ def test_lista_las_etiquetas_guardadas(historial: Path) -> None:
     assert "triggered" in result.stdout
     assert "rearmed" in result.stdout
     assert "filas" in result.stdout
+
+
+def test_una_consola_que_no_conoce_la_raya_no_corta_la_tabla(historial: Path) -> None:
+    """Con una página de códigos sin raya ni comillas tipográficas, igual se lista.
+
+    Es lo que ocurre en un `cmd.exe` de fábrica en español: si el punto de
+    entrada no tolerase el carácter suelto, el comando moriría a mitad de la
+    salida con `UnicodeEncodeError` y el usuario se quedaría sin las filas.
+    """
+    entorno = entorno_utf8()
+    entorno["PYTHONIOENCODING"] = "ascii"
+    result = subprocess.run(
+        [sys.executable, str(TOOL), "log", "--db", str(historial)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=entorno,
+        cwd=ROOT,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "mostradas: 3 de 3" in result.stdout
+    assert "Alarma disparada" in result.stdout
+    assert "UnicodeEncodeError" not in result.stderr

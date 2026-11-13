@@ -37,6 +37,7 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import re
 import sqlite3
 import sys
@@ -1292,7 +1293,25 @@ def _glue_relative_dates(argv: list[str]) -> list[str]:
     return result
 
 
+def _tolerar_consola() -> None:
+    """Que un carácter que la consola no sepa dibujar no corte una tabla.
+
+    Un `cmd.exe` con la página de códigos de fábrica en español (850) no tiene
+    la raya ni las comillas tipográficas que usan los mensajes: sin esto,
+    `alarmctl log` terminaría en `UnicodeEncodeError` a mitad de la salida y el
+    usuario se quedaría sin las filas. Se sustituye el carácter suelto por «?»
+    en vez de reventar; la codificación de la consola no se toca.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # una consola ya envuelta por otro programa
+            continue
+        with contextlib.suppress(ValueError, OSError):
+            reconfigure(errors="replace")
+
+
 def main(argv: list[str] | None = None) -> int:
+    _tolerar_consola()
     raw = list(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(_glue_relative_dates(raw))
     set_beeps_enabled(bool(getattr(args, "beep", False)))

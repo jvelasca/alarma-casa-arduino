@@ -12,6 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from _entorno import entorno_utf8
+
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "tools" / "alarmctl.py"
 
@@ -22,6 +24,7 @@ def _run(*args: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         encoding="utf-8",
+        env=entorno_utf8(),
         cwd=ROOT,
         timeout=120,
     )

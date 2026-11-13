@@ -15,6 +15,22 @@ sigue [Keep a Changelog](https://keepachangelog.com/es/1.1.0/) y la numeración
 
 - Zonas, panel web y bandeja del sistema (F2-F3 de la hoja de ruta).
 
+## [0.1.1] — 2026-11-13
+
+Primera ejecución de la integración continua. No cambia nada de lo que hace la
+aplicación: arregla dos cosas que solo se ven al compilar en otro equipo.
+
+### Corregido
+
+- **Las pruebas de `alarmctl` ya no dependen de la página de códigos del
+  equipo.** El proceso hijo escribía con la codificación de la consola (cp1252,
+  cp850…) y la prueba leía UTF-8, así que los acentos y la raya rompían doce
+  pruebas según la máquina. Ahora el hijo se lanza siempre en UTF-8.
+- **`alarmctl` no se corta si la consola no sabe dibujar un carácter.** En un
+  `cmd.exe` de fábrica en español no existen la raya ni las comillas
+  tipográficas: el comando moría a mitad de la tabla con `UnicodeEncodeError`.
+  Se sustituye el carácter suelto por `?` y la salida sigue adelante.
+
 ## [0.1.0] — 2026-11-13
 
 Primera versión publicada: alarma de presencia completa en un solo PC, con el
@@ -54,8 +70,9 @@ Mega como sensor y la aplicación de escritorio como central.
   `ntfy-test`, `remote-send`, `remote-listen` y `backup` (exportar/importar).
 - **Documentación** — premisas y hoja de ruta, protocolo serie, avisos e
   interfaz, con capturas generadas desde los propios diálogos.
-- **Pruebas y calidad** — 497 pruebas de `pytest`, `ruff` y `mypy` en modo
+- **Pruebas y calidad** — 501 pruebas de `pytest`, `ruff` y `mypy` en modo
   estricto, comprobados en integración continua.
 
-[Sin publicar]: https://github.com/jvelasca/alarma-casa-arduino/compare/v0.1.0...HEAD
+[Sin publicar]: https://github.com/jvelasca/alarma-casa-arduino/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/jvelasca/alarma-casa-arduino/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/jvelasca/alarma-casa-arduino/releases/tag/v0.1.0
