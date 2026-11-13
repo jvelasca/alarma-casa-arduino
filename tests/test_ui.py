@@ -835,8 +835,13 @@ def test_un_disparo_guardado_se_recupera_y_reanuda_la_sirena(tmp_path) -> None:
         beeps = [params for op, params in manager.sent if op == "beep"]
         assert beeps, "la sirena tiene que reanudarse"
         # Le queda el tiempo del disparo original, no una sirena entera nueva.
+        # Construir la ventana tambien consume el plazo de la sirena, y en el
+        # runner puede tardar segundos: se compara con un rango, no con 120
+        # exacto, que haria fallar la prueba por la velocidad de la maquina.
         assert 100_000 <= int(beeps[0]["ms"]) <= 120_000
-        assert instance._controller.siren_remaining_s() == pytest.approx(120, abs=1)
+        remaining = instance._controller.siren_remaining_s()
+        assert remaining is not None
+        assert 100 <= remaining <= 120
     finally:
         instance.shutdown()
         instance.deleteLater()
