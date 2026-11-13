@@ -22,13 +22,17 @@ efectos. Asi se puede probar sin hilos ni hardware; el reloj se inyecta.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Any
 
 from ..protocol.messages import MotionEvent, MotionKind
+
+log = logging.getLogger(__name__)
 
 
 class AlarmState(StrEnum):
@@ -54,6 +58,10 @@ ACTION_SILENCED = "silenced"
 ACTION_REARMING = "rearming"
 ACTION_REARMED = "rearmed"
 ACTION_REARM_EXHAUSTED = "rearm_exhausted"
+
+#: Version del formato del snapshot. Se guarda con el estado para poder
+#: descartar uno antiguo sin romper el arranque.
+SNAPSHOT_VERSION = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -386,6 +394,87 @@ class AlarmController:
         """
         self._siren_s = max(0.0, float(seconds))
 
+    # -- Recuperacion tras un reinicio -------------------------------------
+
+    def to_snapshot(self, now: float | None = None) -> dict[str, object]:
+        """Estado completo para poder retomarlo tras un cierre.
+
+        No basta con recordar «armada»: si el cierre pilla la alarma en el
+        retardo de entrada o con la sirena sonando, al arrancar hay que saber
+        cuanto quedaba. Se guarda el tiempo restante y no el instante de
+        vencimiento porque el reloj del controlador es monotono y empieza de
+        cero en cada proceso; quien recupera descuenta lo que ha pasado fuera.
+        """
+        moment = self._clock() if now is None else now
+        return {
+            "v": SNAPSHOT_VERSION,
+            "state": self._state.value,
+            "saved_at": time.time(),
+            "delay_remaining_s": self.remaining_s(moment),
+            "delay_total_s": self._delay_total_s,
+            "siren_remaining_s": self.siren_remaining_s(moment),
+            "silenced": self._silenced,
+            "rearm_count": self._rearm_count,
+        }
+
+    @classmethod
+    def from_snapshot(
+        cls,
+        snapshot: Mapping[str, object],
+        *,
+        elapsed_s: float = 0.0,
+        clock: Callable[[], float] = time.monotonic,
+        **options: Any,
+    ) -> AlarmController:
+        """Reconstruye el controlador desde ``to_snapshot``.
+
+        ``elapsed_s`` es el tiempo que la aplicacion estuvo cerrada: se descuenta
+        de los plazos, de modo que un retardo de entrada que vencio mientras el
+        PC estaba apagado no se reabre al arrancar. Los plazos vencidos quedan
+        con vencimiento inmediato: la primera llamada a ``tick()`` devuelve la
+        transicion que toca y el llamador decide los efectos.
+        """
+        raw_state = str(snapshot.get("state", "")).strip().lower()
+        try:
+            state = AlarmState(raw_state)
+        except ValueError:
+            log.warning("estado guardado ilegible (%r): se arranca desarmada", raw_state)
+            state = AlarmState.DISARMED
+
+        controller = cls(
+            armed_on_start=state is not AlarmState.DISARMED,
+            clock=clock,
+            **options,
+        )
+        controller._state = state
+        controller._silenced = state is AlarmState.TRIGGERED and bool(
+            snapshot.get("silenced", False)
+        )
+        controller._rearm_count = _as_count(snapshot.get("rearm_count"))
+
+        now = clock()
+        downtime = max(0.0, float(elapsed_s))
+
+        delay_left = _as_seconds(snapshot.get("delay_remaining_s"))
+        if state in DELAY_STATES and delay_left is not None:
+            remaining = max(0.0, delay_left - downtime)
+            controller._deadline = now + remaining
+            total = _as_seconds(snapshot.get("delay_total_s")) or 0.0
+            # El total nunca por debajo de lo que queda: el reloj grande del
+            # hero no debe empezar con mas avanzado que el final.
+            controller._delay_total_s = max(total, remaining, 1.0)
+        else:
+            controller._deadline = None
+            controller._delay_total_s = 0.0
+
+        siren_left = _as_seconds(snapshot.get("siren_remaining_s"))
+        if state is AlarmState.TRIGGERED and siren_left is not None:
+            controller._siren_deadline = now + max(0.0, siren_left - downtime)
+        else:
+            controller._siren_deadline = None
+
+        return controller
+
     # -- Interno -----------------------------------------------------------
 
     def _start_delay(self, seconds: int) -> None:
@@ -406,3 +495,37 @@ class AlarmController:
         elif new_state is not AlarmState.REARMING:
             self._siren_deadline = None
         return Transition(previous, new_state, action)
+
+
+# ---------------------------------------------------------------------------
+# Ayudas de deserializacion
+# ---------------------------------------------------------------------------
+
+
+def _as_seconds(value: object) -> float | None:
+    """Convierte un valor del snapshot en segundos, o ``None`` si no lo es."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return max(0.0, float(value))
+    if isinstance(value, str):
+        try:
+            return max(0.0, float(value))
+        except ValueError:
+            return None
+    return None
+
+
+def _as_count(value: object) -> int:
+    if value is None or isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, float):
+        return max(0, int(value))
+    if isinstance(value, str):
+        try:
+            return max(0, int(value))
+        except ValueError:
+            return 0
+    return 0

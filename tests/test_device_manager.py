@@ -17,8 +17,8 @@ from alarm.protocol.messages import Health
 from alarm.transport.base import LinkError
 
 HELLO = (
-    '{"t":"hello","proto":1,"dev":"Arduino Mega 2560","fw":"1.0","boot":1000,'
-    '"zones":[{"id":1,"name":"PIR","pin":2}],"caps":["pir"]}'
+    '{"t":"hello","proto":1,"dev":"Arduino Mega 2560","fw":"1.7.0","boot":1000,'
+    '"boot_id":1,"zones":[{"id":1,"name":"PIR","pin":2}],"caps":["pir"]}'
 )
 HB = '{"t":"hb","up":1000,"lvl":0,"raw":0,"buf":0,"lost":0}'
 
@@ -239,8 +239,8 @@ MOTION_1 = '{"t":"evt","kind":"motion.start","seq":1,"z":1,"ms":1000}'
 MOTION_1_OTRA_VEZ = '{"t":"evt","kind":"motion.start","seq":1,"z":1,"ms":1000}'
 MOTION_2 = '{"t":"evt","kind":"motion.start","seq":2,"z":1,"ms":2000}'
 HELLO_REINICIO = (
-    '{"t":"hello","proto":1,"dev":"Arduino Mega 2560","fw":"1.0","boot":2000,'
-    '"zones":[{"id":1,"name":"PIR","pin":2}],"caps":["pir"]}'
+    '{"t":"hello","proto":1,"dev":"Arduino Mega 2560","fw":"1.7.0","boot":0,'
+    '"boot_id":2,"zones":[{"id":1,"name":"PIR","pin":2}],"caps":["pir"]}'
 )
 
 
@@ -354,20 +354,182 @@ def test_un_reinicio_de_la_placa_reinicia_la_numeracion() -> None:
         manager.stop(timeout=1.0)
 
 
-def test_reabrir_el_puerto_reinicia_el_acuse() -> None:
-    """Abrir el puerto suele reiniciar la placa; su numeracion vuelve a cero."""
+def test_reabrir_el_puerto_no_reinicia_el_acuse_hasta_ver_el_saludo() -> None:
+    """Reabrir no basta: el acuse se reinicia cuando el `boot_id` es otro.
+
+    Reiniciarlo al abrir descartaba eventos si el adaptador no pulsaba DTR y la
+    placa seguia en la misma sesion; conservarlo los descartaba al reves.
+    """
+    recibidos: list[object] = []
     link = FakeLink()
-    manager = DeviceManager(link, auto_ack=True, reconnect_max_s=0.1, hb_timeout_s=1.0)
+    manager = DeviceManager(
+        link,
+        auto_ack=True,
+        reconnect_max_s=0.1,
+        hb_timeout_s=1.0,
+        on_message=recibidos.append,
+    )
     manager.start()
     try:
         link.push(HELLO)
         assert _esperar(lambda: manager.hello is not None)
         link.push(MOTION_2)
         assert _esperar(lambda: manager.last_seq_acked == 2)
+        assert _esperar(lambda: len(_motions(recibidos)) == 1)
 
         aperturas = link.open_count
         link.caer()
         assert _esperar(lambda: link.open_count > aperturas, timeout=3.0)
+        # El puerto se reabre, pero la placa se presenta con la misma sesion.
+        link.push(HELLO)
+        time.sleep(0.2)
+        assert manager.last_seq_acked == 2, "la misma sesion conserva el acuse"
+
+        # Ahora la placa se ha reiniciado de verdad: otro `boot_id`.
+        link.push(HELLO_REINICIO)
         assert _esperar(lambda: manager.last_seq_acked == 0)
+        link.push(MOTION_1)
+        assert _esperar(lambda: len(_motions(recibidos)) == 2)
+    finally:
+        manager.stop(timeout=1.0)
+
+
+def test_dos_arranques_distintos_con_seq_1_se_procesan_los_dos() -> None:
+    """El fallo de H-02: `seq=1` de una sesion nueva no puede descartarse."""
+    recibidos: list[object] = []
+    link = FakeLink()
+    manager = DeviceManager(link, auto_ack=True, on_message=recibidos.append)
+    manager.start()
+    try:
+        link.push(HELLO)
+        link.push(MOTION_1)
+        assert _esperar(lambda: len(_motions(recibidos)) == 1)
+
+        # Reinicio por watchdog con el puerto abierto: otro `boot_id`, seq=1.
+        link.push(HELLO_REINICIO)
+        assert _esperar(lambda: manager.session_boot_id == 2)
+        link.push(MOTION_1)
+        assert _esperar(lambda: len(_motions(recibidos)) == 2)
+    finally:
+        manager.stop(timeout=1.0)
+
+
+def test_el_acuse_de_una_sesion_anterior_no_borra_la_nueva() -> None:
+    """Si la placa se reinicia entre procesar y confirmar, el ACK viejo sobra."""
+    link = FakeLink()
+    manager = DeviceManager(link, auto_ack=False)
+    manager.start()
+    try:
+        link.push(HELLO)
+        assert _esperar(lambda: manager.hello is not None)
+        link.push(HELLO_REINICIO)
+        assert _esperar(lambda: manager.session_boot_id == 2)
+        manager.ack_events(9, boot_id=1)
+        time.sleep(0.2)
+        assert manager.last_seq_acked == 0
+        assert _acks(link) == []
+    finally:
+        manager.stop(timeout=1.0)
+
+
+def test_un_latido_que_retrocede_delata_un_reinicio_sin_hello() -> None:
+    """El watchdog reinicia la placa sin cerrar el puerto: `up` vuelve a cero."""
+    link = FakeLink()
+    manager = DeviceManager(link, auto_ack=True)
+    manager.start()
+    try:
+        link.push(HELLO)
+        assert _esperar(lambda: manager.hello is not None)
+        link.push('{"t":"hb","up":90000,"lvl":0,"raw":0,"buf":0,"lost":0}')
+        link.push(MOTION_2)
+        assert _esperar(lambda: manager.last_seq_acked == 2)
+
+        link.push('{"t":"hb","up":40,"lvl":0,"raw":0,"buf":0,"lost":0}')
+        assert _esperar(lambda: manager.last_seq_acked == 0)
+        # El gestor pide un `hello` para conocer el `boot_id` de la sesion.
+        assert _esperar(lambda: any(line.endswith(" hello") for line in link.written))
+        assert manager.stats.reboots >= 1
+    finally:
+        manager.stop(timeout=1.0)
+
+
+def test_el_saludo_del_watchdog_se_anota_como_motivo() -> None:
+    """`cfg.wdt_rst` es lo unico que distingue un cuelgue de un tiron de cable."""
+    hello_wdt = (
+        '{"t":"hello","proto":1,"dev":"Arduino Mega 2560","fw":"1.7.0","boot":0,'
+        '"boot_id":5,"zones":[{"id":1,"name":"PIR","pin":2}],"caps":["pir"],'
+        '"cfg":{"wdt_rst":1}}'
+    )
+    link = FakeLink()
+    manager = DeviceManager(link, auto_ack=True)
+    manager.start()
+    try:
+        link.push(HELLO)
+        assert _esperar(lambda: manager.session_boot_id == 1)
+        link.push(hello_wdt)
+        assert _esperar(lambda: manager.session_boot_id == 5)
+        assert manager.last_reboot_reason == "watchdog"
+        assert manager.stats.reboots >= 1
+
+        # Un arranque normal (sin `wdt_rst`) se anota como corte de alimentacion.
+        link.push(HELLO_REINICIO)
+        assert _esperar(lambda: manager.session_boot_id == 2)
+        assert manager.last_reboot_reason == "power"
+    finally:
+        manager.stop(timeout=1.0)
+
+
+def test_un_evento_que_llega_antes_del_hello_no_se_pierde() -> None:
+    """Un reset por watchdog puede escupir el evento antes que el saludo.
+
+    Sin identidad no se puede deduplicar, asi que el gestor lo aparca y lo
+    entrega cuando llega el `hello`, ya con el `boot_id` de la sesion.
+    """
+    recibidos: list[object] = []
+    link = FakeLink()
+    manager = DeviceManager(link, auto_ack=True, on_message=recibidos.append)
+    manager.start()
+    try:
+        link.push(MOTION_1)
+        # El evento no se entrega sin sesion, pero tampoco se tira.
+        time.sleep(0.2)
+        assert _motions(recibidos) == []
+        assert manager.stats.dropped_before_hello == 0
+
+        link.push(HELLO)
+        assert _esperar(lambda: len(_motions(recibidos)) == 1)
+        evento = _motions(recibidos)[0]
+        assert getattr(evento, "boot_id", None) == 1, "el gestor inyecta la sesion"
+        assert _esperar(lambda: manager.last_seq_acked == 1)
+    finally:
+        manager.stop(timeout=1.0)
+
+
+def test_un_firmware_sin_boot_id_se_marca_como_no_fiable() -> None:
+    """1.6.0 funciona, pero la deduplicacion entre sesiones no se promete."""
+    hello_antiguo = (
+        '{"t":"hello","proto":1,"dev":"Arduino Mega 2560","fw":"1.6.0","boot":0,'
+        '"zones":[{"id":1,"name":"PIR","pin":2}],"caps":["pir"]}'
+    )
+    recibidos: list[object] = []
+    link = FakeLink()
+    manager = DeviceManager(link, auto_ack=True, on_message=recibidos.append)
+    manager.start()
+    try:
+        link.push(hello_antiguo)
+        assert _esperar(lambda: manager.hello is not None)
+        assert manager.session_boot_id is None
+        assert manager.stats.legacy_sessions == 1
+
+        link.push(MOTION_2)
+        assert _esperar(lambda: manager.last_seq_acked == 2)
+        # El evento viaja sin identidad: el historial no apunta la clave.
+        assert getattr(_motions(recibidos)[0], "boot_id", 1) is None
+
+        # Un `hello` repetido de la misma sesion no reinicia el acuse.
+        link.push(hello_antiguo)
+        time.sleep(0.2)
+        assert manager.last_seq_acked == 2
+        assert manager.stats.legacy_sessions == 1
     finally:
         manager.stop(timeout=1.0)

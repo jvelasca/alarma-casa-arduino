@@ -48,16 +48,22 @@
  * escritura que no vuelve), la placa se reinicia sola en vez de quedarse muda
  * para siempre. El PC ve el latido desaparecer y luego el `hello` de la placa
  * reiniciada, con `cfg.wdt_rst` a 1 en ese primer saludo.
+ *
+ * Identidad de arranque: `boot_id` es un contador de 32 bits que vive en la
+ * EEPROM y sube en cada arranque. `boot` (millis) siempre vale ~0 y no sirve
+ * para distinguir sesiones; `boot_id` si. El PC compone con el la clave
+ * (boot_id, seq) para no procesar dos veces el mismo evento.
  */
 
 #include <avr/wdt.h>
+#include <EEPROM.h>
 #include <string.h>
 
 // ---------------------------------------------------------------------------
 // Identidad y pines
 // ---------------------------------------------------------------------------
 
-const char FW_VERSION[] = "1.6.0";
+const char FW_VERSION[] = "1.7.0";
 
 const uint8_t PIN_PIR = 2;     // INT4 en el Mega
 const uint8_t PIN_LED = 13;    // LED integrado
@@ -65,6 +71,22 @@ const uint8_t PIN_LED = 13;    // LED integrado
 // el PWM de este pin (OC1A) no se usa. D11 tambien es MOSI del SPI, que aqui
 // no se toca. El piezo se puentea entre D11 y el GND contiguo a D13.
 const uint8_t PIN_BUZZER = 11;
+
+// ---------------------------------------------------------------------------
+// Identidad de arranque (EEPROM)
+//
+// `boot` (millis) vale ~0 en cada arranque y no distingue una sesion de otra:
+// tras un reset por watchdog o un tiron del USB el PC veria el mismo valor y
+// no podria deduplicar. `boot_id` es un contador que sube en cada arranque y
+// se guarda en dos ranuras ping-pong con magic y CRC16: si el corte de luz
+// llega a mitad de escritura, la ranura tocada queda invalida y la otra sigue
+// sirviendo. Escribir en la ranura alterna reparte el desgaste (100 000 ciclos
+// por celda) y solo se hace una vez por arranque, nunca en `loop()`.
+// ---------------------------------------------------------------------------
+
+const uint16_t BOOT_MAGIC  = 0x42A7;
+const uint8_t  BOOT_SLOT_A = 0x00;
+const uint8_t  BOOT_SLOT_B = 0x10;
 
 // ---------------------------------------------------------------------------
 // Configuracion (modificable por comando)
@@ -123,6 +145,9 @@ bool     g_warmupDone  = false;
 bool     g_stableLevel = false;
 bool     g_changeArmed = false;
 uint32_t g_changeMs    = 0;
+// `boot_id` sube en cada arranque y es la identidad real de la sesion; `boot`
+// (millis) vale ~0 siempre y solo sirve como informacion de diagnostico.
+uint32_t g_bootId      = 0;
 uint32_t g_bootMs      = 0;
 uint32_t g_activityAt  = 0;
 uint32_t g_tLastHb     = 0;
@@ -182,6 +207,75 @@ uint32_t clampU32(uint32_t v, uint32_t lo, uint32_t hi) {
   if (v < lo) return lo;
   if (v > hi) return hi;
   return v;
+}
+
+// CRC16-CCITT (polinomio 0x1021, semilla 0xFFFF): detecta una escritura de
+// EEPROM a medias mucho mejor que el magic solo.
+uint16_t crc16Ccitt(const uint8_t *data, uint8_t len) {
+  uint16_t crc = 0xFFFF;
+  for (uint8_t i = 0; i < len; ++i) {
+    crc ^= (uint16_t)data[i] << 8;
+    for (uint8_t bit = 0; bit < 8; ++bit) {
+      if (crc & 0x8000) crc = (uint16_t)((crc << 1) ^ 0x1021);
+      else              crc = (uint16_t)(crc << 1);
+    }
+  }
+  return crc;
+}
+
+bool readBootSlot(uint8_t addr, uint32_t *value) {
+  uint8_t raw[6];
+  for (uint8_t i = 0; i < 6; ++i) raw[i] = EEPROM.read((int)addr + i);
+  const uint16_t magic = (uint16_t)raw[0] | ((uint16_t)raw[1] << 8);
+  if (magic != BOOT_MAGIC) return false;
+  const uint16_t stored = (uint16_t)EEPROM.read((int)addr + 6) |
+                          ((uint16_t)EEPROM.read((int)addr + 7) << 8);
+  if (crc16Ccitt(raw, 6) != stored) return false;
+  *value = (uint32_t)raw[2] | ((uint32_t)raw[3] << 8) |
+           ((uint32_t)raw[4] << 16) | ((uint32_t)raw[5] << 24);
+  return true;
+}
+
+void writeBootSlot(uint8_t addr, uint32_t value) {
+  uint8_t raw[6];
+  raw[0] = (uint8_t)(BOOT_MAGIC & 0xFF);
+  raw[1] = (uint8_t)(BOOT_MAGIC >> 8);
+  raw[2] = (uint8_t)(value & 0xFF);
+  raw[3] = (uint8_t)((value >> 8) & 0xFF);
+  raw[4] = (uint8_t)((value >> 16) & 0xFF);
+  raw[5] = (uint8_t)((value >> 24) & 0xFF);
+  const uint16_t crc = crc16Ccitt(raw, 6);
+  // `update` solo escribe la celda si cambia: menos desgaste y menos tiempo
+  // con las interrupciones desactivadas que un `write` a ciegas.
+  for (uint8_t i = 0; i < 6; ++i) EEPROM.update((int)addr + i, raw[i]);
+  EEPROM.update((int)addr + 6, (uint8_t)(crc & 0xFF));
+  EEPROM.update((int)addr + 7, (uint8_t)(crc >> 8));
+}
+
+// Devuelve el identificador de este arranque, ya incrementado y guardado.
+// La primera vez que se flashea la placa ambas ranuras estan a 0xFF, ninguna
+// valida, y el contador empieza en 1.
+uint32_t nextBootId() {
+  uint32_t a = 0, b = 0;
+  const bool okA = readBootSlot(BOOT_SLOT_A, &a);
+  const bool okB = readBootSlot(BOOT_SLOT_B, &b);
+
+  uint32_t last = 0;
+  uint8_t target = BOOT_SLOT_A;
+  if (okA && okB) {
+    if (a >= b) { last = a; target = BOOT_SLOT_B; }
+    else        { last = b; target = BOOT_SLOT_A; }
+  } else if (okA) {
+    last = a;
+    target = BOOT_SLOT_B;
+  } else if (okB) {
+    last = b;
+    target = BOOT_SLOT_A;
+  }
+
+  const uint32_t next = last + 1;
+  writeBootSlot(target, next);
+  return next;
 }
 
 uint32_t readRawEdges() {
@@ -497,6 +591,8 @@ void emitHello() {
   Serial.print(FW_VERSION);
   Serial.print(F("\",\"boot\":"));
   Serial.print(g_bootMs);
+  Serial.print(F(",\"boot_id\":"));
+  Serial.print(g_bootId);
   Serial.print(F(",\"zones\":[{\"id\":1,\"pin\":"));
   Serial.print(PIN_PIR);
   Serial.print(F(",\"name\":\"pir\"}]"));
@@ -886,6 +982,9 @@ void setup() {
 
   Serial.begin(115200);
 
+  // El contador de arranque se toca una sola vez por sesion y antes de emitir
+  // el `hello`, para que este salga ya con la identidad definitiva.
+  g_bootId      = nextBootId();
   g_bootMs      = millis();
   g_tLastHb     = g_bootMs;
   g_tLastWarmup = g_bootMs;

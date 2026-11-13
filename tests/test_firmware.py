@@ -77,9 +77,9 @@ def test_el_ready_real_se_decodifica() -> None:
 
 
 def _cuerpo(name: str) -> str:
-    """Devuelve el cuerpo de `void name(...)`, sin las llaves exteriores."""
+    """Devuelve el cuerpo de `tipo name(...)`, sin las llaves exteriores."""
     source = FIRMWARE.read_text(encoding="utf-8")
-    match = re.search(rf"void {name}\([^)]*\) \{{(.*?)\n\}}", source, re.S)
+    match = re.search(rf"\w+ {name}\([^)]*\) \{{(.*?)\n\}}", source, re.S)
     assert match, f"no se encuentra la funcion {name} en el sketch"
     return match.group(1)
 
@@ -112,6 +112,104 @@ def test_el_hello_del_sketch_es_json_valido() -> None:
     assert data["proto"] == 1
     assert data["cfg"].keys() >= {"warmup_ms", "buzzer_pin", "buzzer", "armed", "wdt_rst"}
     assert data["zones"] == [{"id": 1, "pin": 0, "name": "pir"}]
+    assert "boot_id" in data, "el hello tiene que anunciar la sesion de arranque"
+
+
+# -- Identidad de arranque en EEPROM ---------------------------------------
+
+
+def test_el_sketch_guarda_el_boot_id_en_dos_ranuras_con_crc() -> None:
+    """H-02: sin identidad de sesion el PC no puede deduplicar.
+
+    El contador va en EEPROM para sobrevivir al reinicio, en dos ranuras
+    alternas con magic y CRC16 para que un corte a mitad de escritura no lo
+    destruya.
+    """
+    source = FIRMWARE.read_text(encoding="utf-8")
+
+    assert "#include <EEPROM.h>" in source
+    assert "BOOT_SLOT_A" in source and "BOOT_SLOT_B" in source, "faltan las dos ranuras"
+    assert "BOOT_MAGIC" in source, "falta el magic que valida la ranura"
+    assert "crc16Ccitt" in source, "falta el CRC de la ranura"
+    assert "EEPROM.update" in source, "se escribe la EEPROM sin `update`"
+    assert "uint32_t nextBootId()" in source, "falta el incremento del contador"
+
+
+def test_la_eeprom_solo_se_toca_una_vez_por_arranque() -> None:
+    """Escribir EEPROM en `loop()` la gastaria en semanas (100 000 ciclos)."""
+    setup = _cuerpo("setup")
+    loop = _cuerpo("loop")
+
+    assert "nextBootId()" in setup
+    assert setup.index("nextBootId()") < setup.index("emitHello()"), (
+        "el hello tiene que salir ya con el boot_id definitivo"
+    )
+    assert "EEPROM" not in loop, "ninguna escritura de EEPROM dentro de loop()"
+
+
+def test_una_ranura_solo_vale_con_magic_y_crc_correctos() -> None:
+    """Un corte a mitad de escritura deja la ranura invalida, no un valor falso.
+
+    `readBootSlot` tiene que comprobar el magic *y* el CRC16 antes de aceptar
+    los cuatro bytes del contador. Aceptar el magic solo convertiria una
+    escritura a medias en un `boot_id` basura que el PC tomaria por bueno.
+    """
+    read = _cuerpo("readBootSlot")
+    write = _cuerpo("writeBootSlot")
+
+    assert "magic != BOOT_MAGIC" in read
+    assert "crc16Ccitt(raw, 6) != stored" in read, "el CRC se lee y se compara"
+    assert "raw[2] | ((uint32_t)raw[3] << 8)" in read, "el contador es de 32 bits"
+    assert "crc16Ccitt(raw, 6)" in write, "al escribir se sella el CRC"
+    assert "EEPROM.update" in write
+    assert "EEPROM.write" not in write, "`write` gasta la celda aunque el valor no cambie"
+
+
+def test_el_contador_de_arranque_elige_la_ranura_correcta() -> None:
+    """Ping-pong: se toma el mayor valido y se escribe en la *otra* ranura.
+
+    Asi un corte mientras se graba no destruye el ultimo contador conocido: la
+    ranura vieja sigue intacta y el siguiente arranque la lee.
+    """
+    source = FIRMWARE.read_text(encoding="utf-8")
+    body = _cuerpo("nextBootId")
+
+    assert source.count("BOOT_SLOT_A = 0x") == 1
+    assert "BOOT_SLOT_B = 0x10" in source, "las ranuras no pueden solaparse"
+    assert "readBootSlot(BOOT_SLOT_A" in body and "readBootSlot(BOOT_SLOT_B" in body
+    assert "if (a >= b)" in body, "con las dos validas manda la mayor"
+    assert "last = b" in body, "si solo vale B se parte de B"
+    assert "uint32_t next = last + 1;" in body, "32 bits: el contador no se corta en 16"
+    # Con las dos ranuras validas se toma la mayor y se escribe en la otra.
+    assert "if (a >= b) { last = a; target = BOOT_SLOT_B; }" in body
+    assert "else        { last = b; target = BOOT_SLOT_A; }" in body
+    # Y con una sola valida, tambien en la contraria.
+    assert "} else if (okA) {" in body and "} else if (okB) {" in body
+    assert "writeBootSlot(target, next)" in body
+    assert body.index("writeBootSlot(target, next)") < body.index("return next")
+
+
+def test_el_boot_id_cero_no_es_el_de_un_firmware_antiguo() -> None:
+    """El PC usa `None` para firmware sin identidad; 0 es un valor legitimo."""
+    from alarm.protocol.codec import decode_line
+    from alarm.protocol.messages import Hello
+
+    sin_id = decode_line(
+        '{"t":"hello","proto":1,"dev":"mega-pir","fw":"1.6.0","boot":0,"zones":[],"cfg":{}}'
+    )
+    con_cero = decode_line(
+        '{"t":"hello","proto":1,"dev":"mega-pir","fw":"1.7.0","boot":0,"boot_id":0,'
+        '"zones":[],"cfg":{}}'
+    )
+
+    assert isinstance(sin_id, Hello) and isinstance(con_cero, Hello)
+    assert sin_id.boot_id is None
+    assert con_cero.boot_id == 0
+
+
+def test_la_version_del_firmware_anuncia_el_cambio() -> None:
+    source = FIRMWARE.read_text(encoding="utf-8")
+    assert 'FW_VERSION[] = "1.7.0"' in source
 
 
 def test_el_pin_del_zumbador_del_sketch_coincide_con_la_configuracion() -> None:

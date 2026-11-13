@@ -250,9 +250,10 @@ Motivos, por orden de peso:
 - **Interrupción** en el pin 2 con `CHANGE` (equivalente a `RISING` y `FALLING` juntos, y una sola llamada a `attachInterrupt`); el manejador solo cuenta flancos y sella `millis()`.
 - **Antirrebote** de 50 ms en el bucle principal: el nivel tiene que mantenerse distinto del estable ese tiempo antes de aceptarse, y el evento se sella con la hora del flanco, no con la de confirmación.
 - **Estado de calentamiento** de 60 s tras el arranque: no se emiten eventos de intrusión, solo latidos con `warmup:1`.
-- **Buffer circular** de **16 eventos** pendientes de acuse (`EVT_CAP` en el sketch); si se llena, descarta los más antiguos y lo reporta con el contador `lost` del latido. Caben tres segundos de rebotes sin perder nada, y como el PC acusa en cuanto lee, no hace falta más.
+- **Buffer circular** de **16 eventos** pendientes de acuse (`EVT_CAP` en el sketch); si se llena, descarta los más antiguos y lo reporta con el contador `lost` del latido. Caben tres segundos de rebotes sin perder nada, y como el PC acusa en cuanto guarda el evento, no hace falta más. Si el PC no puede guardarlo (disco lleno y buzón también bloqueado), **no acusa**: el evento se queda en el buffer y la ventana lo dice.
 - **Watchdog** de 8 s (`wdt_enable(WDTO_8S)`) para recuperarse de un bloqueo. `setup()` limpia `MCUSR` y desactiva el perro antes de nada (la receta que evita el bucle de reinicios del gestor de arranque) y lo arma al final; `loop()` lo alimenta en su primera línea. Si el arranque anterior fue del watchdog, el primer `hello` lo dice con `cfg.wdt_rst: 1`.
-- **Configuración en RAM**, no en EEPROM: el PC es la fuente de verdad y reenvía la suya en cada handshake (ADR-024). Así no hay una segunda copia que pueda quedar desfasada, y un cambio en el TOML se aplica al conectar sin ningún paso de grabación.
+- **Configuración en RAM**, no en EEPROM: el PC es la fuente de verdad y reenvía la suya en cada handshake (ADR-024). Así no hay una segunda copia que pueda quedar desfasada, y un cambio en el TOML se aplica al conectar sin ningún paso de grabación. La **única** excepción es `boot_id` (ver abajo): no es configuración, es identidad.
+- **Identidad de arranque en EEPROM.** `boot_id` es un contador de 32 bits en dos ranuras alternas con magic y CRC16 que sube una vez por arranque y viaja en `hello`. Es lo que permite al PC deduplicar por `(boot_id, seq)`: `boot` es `millis()` y vale ~0 en todos los arranques. Se escribe una sola vez, al final de `setup()`, y nunca en `loop()` (las celdas aguantan 100 000 ciclos; una escritura por vuelta las gastaría en semanas). El ping-pong reparte el desgaste y sobrevive a un corte a mitad de escritura.
 - **LED de estado** en el pin 13: parpadea cada 500 ms durante el calentamiento y después copia el nivel del PIR, que es lo que sirve para orientar el sensor y para ver de un vistazo que hay detección. El estado de enlace se ve en la ventana, no en la placa.
 - **Longitud máxima de línea** de 96 bytes en el downlink (`CMD_CAP`); las líneas más largas se descartan hasta el siguiente salto y se contesta `{"t":"err","code":"oversize"}`. El uplink cabe de sobra en los 512 bytes que acepta el PC.
 - **Sin memoria dinámica.** No se usa `String`, ni `malloc`, ni `new`: todos los buffers son de tamaño fijo, para no fragmentar los 8 KB del Mega con una aplicación que va a estar meses encendida.
@@ -269,6 +270,10 @@ Lo que el sistema **no** hace, dicho antes de que lo descubra quien lo audite:
 - **Sin teclado físico.** No hay teclado de membrana ni RFID: el mando es por ntfy con clave o TOTP. Si se cae la red o el PC, no queda forma local de desarmar salvo la ventana del propio PC, que está al lado de la alarma por definición.
 - **Un solo sensor, una sola zona.** El antirrebote y el calentamiento son por placa, no por zona, porque no hay más zonas. Un PIR defectuoso que se quede en alto mantiene el sistema en `DISPARADA` hasta que alguien lo desarme: hay rearme con tope justo por eso.
 - **El watchdog del PC es el latido**, no un `wdt` del sistema operativo: si la ventana se cuelga, la placa sigue detectando y pitando, pero los avisos se quedan en la cola hasta que la ventana vuelva.
+- **El buffer de la placa vive en RAM.** Son 16 eventos sin confirmar. Un reset por watchdog con el buffer lleno pierde los que quedaban, y el PC solo puede contarlos cuando vuelve el latido (`lost`) o cuando pide `replay` y ya no están. El buzón durable del PC (`data/spool/`) cubre el fallo del disco, **no** el de la placa: no hay ningún almacenamiento duradero a bordo.
+- **El ACK no se da sin escritura durable.** Si SQLite falla y el buzón tampoco se puede escribir (disco lleno, carpeta de solo lectura), el evento **no se confirma**: la placa lo conserva y lo reenvía, y la ventana muestra `REGISTRO NO PERSISTENTE`. Es el comportamiento buscado, pero conviene saberlo: con el disco roto, el buffer se llena en 16 eventos y luego se pierde lo más antiguo.
+- **El buzon no sustituye una prueba fisica.** Que el evento quede en `data/spool/*.jsonl` demuestra que se escribio en disco, no que la sirena sono ni que el aviso llego. La prueba de desconectar el USB entre recibir y confirmar, el reinicio por watchdog y el cierre en `PENDING`/`TRIGGERED`/`REARMING` sigue siendo manual.
+- **Con firmware 1.6.0 o anterior no hay deduplicación fiable.** Falta `boot_id` y `boot` vale ~0 en todos los arranques, así que un evento reenviado tras una reconexión puede procesarse dos veces. La aplicación lo avisa en el registro. Con el firmware 1.7.0 el problema desaparece.
 
 ---
 
@@ -355,7 +360,7 @@ flowchart TD
 | `transport.simulated_link` | Implementación del mismo puerto para desarrollo: genera eventos sintéticos | Existir en producción |
 | `protocol.messages` | Modelos tipados (`Hello`, `Heartbeat`, `MotionEvent`, `Ack`, `Command`) | Tocar el puerto |
 | `protocol.codec` | Serializar y deserializar NDJSON, validar esquema, descartar líneas corruptas | Contener reglas de negocio |
-| `device.manager` | Handshake, envío de configuración, deduplicación por `seq`, envío de `ack`, watchdog del heartbeat y transiciones de salud con `ever_online` y `next_retry_in` | Decidir si hay intrusión |
+| `device.manager` | Handshake, envío de configuración, deduplicación por `(boot_id, seq)`, envío de `ack` por sesión, watchdog del heartbeat y transiciones de salud con `ever_online` y `next_retry_in` | Decidir si hay intrusión |
 | `device.health` | Estado del enlace (`ONLINE`, `DEGRADED`, `OFFLINE`), contadores de pérdida | Notificar directamente |
 | `core.event_bus` | Publicación/suscripción tipada en proceso | Ser un bus distribuido |
 | `core.alarm_fsm` | Máquina de estados de la alarma, retardos y transiciones | Enviar mensajes ni escribir en disco |
@@ -684,6 +689,9 @@ CREATE TABLE schema_version (
   de dominio de F2.
 - Eventos de nivel `debug`/`info` de tipos ruidosos: 90 días.
 - Eventos `warning`/`critical` y auditoría: 2 años.
+- Claves `(boot_id, seq)` de `processed_events` (implementado en 0.1.4): 30 días.
+  Son la prueba de que un reenvío ya se atendió; perderlas antes de tiempo
+  volvería a duplicar una intrusión antigua.
 - Purga diaria a las 04:00 local; antes de borrar, rotación opcional a CSV en `data/archive/`.
 - El log de aplicación (`logs/alarm.log`) usa rotación por tamaño (10 MB × 10) y **nunca** contiene secretos: el logger redacta tokens, contraseñas y números completos de teléfono.
 

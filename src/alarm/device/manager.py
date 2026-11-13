@@ -7,7 +7,7 @@ import threading
 import time
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from ..protocol.codec import decode_line, encode_ack_events, encode_cmd
 from ..protocol.messages import (
@@ -36,13 +36,22 @@ class Stats:
     reconnects: int = 0
     handshake_timeouts: int = 0
     duplicates: int = 0
+    # Sesiones de firmware sin `boot_id` (1.6.0 y anteriores): se pueden
+    # procesar dos veces los eventos que el PC recibio pero no llego a
+    # confirmar. Se cuentan para no dar por buena una deduplicacion que ese
+    # firmware no permite.
+    legacy_sessions: int = 0
+    # Eventos que llegaron antes del `hello` y no se pudieron ubicar en
+    # ninguna sesion.
+    dropped_before_hello: int = 0
     last_error: str = ""
 
     def describe(self) -> str:
         return (
             f"lineas={self.lines_rx} errores={self.decode_errors} "
             f"eventos={self.events_rx} reconexiones={self.reconnects} "
-            f"sin_saludo={self.handshake_timeouts} duplicados={self.duplicates}"
+            f"sin_saludo={self.handshake_timeouts} duplicados={self.duplicates} "
+            f"sin_boot_id={self.legacy_sessions}"
         )
 
 
@@ -92,6 +101,18 @@ class DeviceManager:
         self.hello: Hello | None = None
         self.last_seq_acked = 0
 
+        # Identidad de la sesion en curso. `boot_id` la da el firmware; con el
+        # se compone (boot_id, seq) y un reinicio de la placa deja de parecer
+        # una continuacion de la sesion anterior. `None` = firmware antiguo.
+        self._boot_id: int | None = None
+        self._last_up_ms: int | None = None
+        self._reboot_reason = ""
+        # Eventos que llegaron antes del `hello` de la sesion: se guardan y se
+        # despachan en cuanto se conoce el `boot_id`, en vez de perderlos o
+        # entregarlos sin identidad.
+        self._pre_hello: list[MotionEvent] = []
+        self._pre_hello_cap = 64
+
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -104,6 +125,9 @@ class DeviceManager:
         self._ack_target = 0
         self._ack_dirty = False
         self._replay_pending = False
+        # Peticion de `hello` desde el hilo lector cuando el latido delata un
+        # reinicio que no llego a verse como tal.
+        self._hello_pending = False
 
         self._last_hb: float | None = None
         self._last_rx: float | None = None
@@ -174,6 +198,20 @@ class DeviceManager:
         if self._next_retry_at is None:
             return None
         return max(0.0, self._next_retry_at - time.monotonic())
+
+    @property
+    def session_boot_id(self) -> int | None:
+        """Identidad de la sesion en curso, o ``None`` si el firmware no la da.
+
+        Con ``None`` no se puede garantizar que un evento no se procese dos
+        veces tras una reconexion: el firmware antiguo no distingue arranques.
+        """
+        return self._boot_id
+
+    @property
+    def last_reboot_reason(self) -> str:
+        """Motivo del ultimo reinicio visto: ``watchdog``, ``power`` o ``"``."""
+        return self._reboot_reason
 
     @property
     def health(self) -> Health:
@@ -256,17 +294,25 @@ class DeviceManager:
             time.sleep(0.02)
         return self.hello
 
-    def ack_events(self, seq: int) -> None:
+    def ack_events(self, seq: int, boot_id: int | None = None) -> None:
         """Confirma eventos hasta ``seq``. Seguro desde cualquier hilo.
 
-        El ACK solo debe llegar cuando el consumidor ha procesado el evento
-        (la ventana lo hace despues de persistirlo). Aqui solo se apunta el
-        numero: escribirlo es cosa del hilo lector, asi la interfaz no toca el
-        puerto y dos hilos no se pisan el mismo enlace.
+        El ACK solo debe llegar cuando el consumidor ha procesado el evento y
+        lo ha guardado (la ventana lo hace despues de persistirlo). Aqui solo
+        se apunta el numero: escribirlo es cosa del hilo lector, asi la
+        interfaz no toca el puerto y dos hilos no se pisan el mismo enlace.
+
+        ``boot_id`` evita un fallo sutil: si la placa se reinicio entre que el
+        evento se proceso y que se confirma, ``seq`` pertenece a una sesion que
+        ya no existe. Confirmarla borraria eventos de la sesion nueva, que
+        empieza otra vez en 1.
         """
         if seq <= 0:
             return
         with self._lock:
+            if boot_id is not None and self._boot_id is not None and boot_id != self._boot_id:
+                log.debug("acuse ignorado: sesion %s, actual %s", boot_id, self._boot_id)
+                return
             if seq <= self.last_seq_acked:
                 return
             # Monotono y acumulativo: confirmar N confirma todo lo anterior.
@@ -285,15 +331,13 @@ class DeviceManager:
                     self._opened_at = time.monotonic()
                     self._session_hello = False
                     self._replay_done = False
-                    # Cada apertura es una sesion nueva. El firmware numera sus
-                    # eventos desde cero tras un reinicio (que es lo que provoca
-                    # abrir el puerto por DTR), asi que conservar el acuse viejo
-                    # descartaria los primeros eventos de la placa. Su `boot` es
-                    # casi siempre 0, de modo que no sirve para distinguirlo.
+                    self._last_up_ms = None
                     with self._lock:
-                        self.last_seq_acked = 0
-                        self._ack_target = 0
-                        self._ack_dirty = False
+                        self._pre_hello.clear()
+                        self._hello_pending = False
+                    # El acuse NO se reinicia aqui: lo decide el `hello` con el
+                    # `boot_id`, para no descartar eventos de una sesion que
+                    # sigue viva ni los primeros de una que acaba de empezar.
                     backoff = 1.0
                     if self._opened_once:
                         self.stats.reconnects += 1
@@ -343,24 +387,34 @@ class DeviceManager:
             self._dispatch(message)
 
     def _flush_control(self) -> None:
-        """Escribe el ACK pendiente y, si toca, pide el `replay`."""
+        """Escribe el ACK, el `hello` y el `replay` pendientes."""
         with self._lock:
             ack = self._ack_target if self._ack_dirty else 0
             replay = self._replay_pending
             self._replay_pending = False
+            hello = self._hello_pending
+            self._hello_pending = False
         if ack:
             # Solo se marca limpio si no aparecio otro ACK mientras se escribia.
             self._link.write_line(encode_ack_events(ack))
             with self._lock:
                 if self._ack_target == ack:
                     self._ack_dirty = False
+        if hello:
+            # Reclamado cuando el latido delata un reinicio que no vimos: hace
+            # falta el saludo nuevo para conocer el `boot_id` de la sesion.
+            self._link.write_line(self._new_cmd("hello"))
         if replay:
             # Los eventos que la placa no habia confirmado se reenvian ahora;
-            # los ya procesados se descartan por `last_seq_acked`.
-            with self._lock:
-                cmd_id = self._next_id
-                self._next_id += 1
-            self._link.write_line(encode_cmd(cmd_id, "replay"))
+            # los ya procesados se descartan por `(boot_id, seq)`.
+            self._link.write_line(self._new_cmd("replay"))
+
+    def _new_cmd(self, op: str) -> str:
+        """Reserva un id y devuelve la orden ya codificada."""
+        with self._lock:
+            cmd_id = self._next_id
+            self._next_id += 1
+        return encode_cmd(cmd_id, op)
 
     def _wait_retry(self, delay: float) -> bool:
         """Espera antes del proximo intento y publica la cuenta atras.
@@ -425,19 +479,8 @@ class DeviceManager:
         self._set_health(Health.ONLINE)
 
         if isinstance(message, Hello):
-            # Un `hello` repetido es normal (lo pide el PC para resincronizar).
-            # Solo es un reinicio real si cambio el instante de arranque.
             self._session_hello = True
-            rebooted = self.hello is not None and message.boot_ms != self.hello.boot_ms
-            if rebooted:
-                self.stats.reboots += 1
-                # La placa vuelve a numerar sus eventos desde cero: conservar el
-                # acuse anterior descartaria los primeros de la sesion nueva.
-                with self._lock:
-                    self.last_seq_acked = 0
-                    self._ack_target = 0
-                    self._ack_dirty = False
-                log.info("dispositivo reiniciado (boot=%d ms)", message.boot_ms)
+            self._start_session_if_needed(message)
             self.hello = message
             self._last_hb = time.monotonic()
             self._connected.set()
@@ -447,19 +490,23 @@ class DeviceManager:
                 if not self._replay_done:
                     self._replay_done = True
                     self._replay_pending = True
+            self._drain_pre_hello()
         elif isinstance(message, Heartbeat):
             self._last_hb = time.monotonic()
+            self._track_uptime(message.up_ms)
         elif isinstance(message, MotionEvent):
             self.stats.events_rx += 1
-            with self._lock:
-                already = message.seq <= self.last_seq_acked
-            if already:
-                # Reenvio de un evento ya procesado y confirmado. Se cuenta y
-                # no se entrega: el consumidor no debe registrar dos veces.
-                self.stats.duplicates += 1
+            if not self._session_hello:
+                # Sin `hello` no hay `boot_id`: el evento se aparca y se
+                # despacha en cuanto llegue el saludo, en vez de entregarlo sin
+                # identidad (y arriesgar un duplicado que nadie puede detectar).
+                if len(self._pre_hello) < self._pre_hello_cap:
+                    self._pre_hello.append(message)
+                else:
+                    self.stats.dropped_before_hello += 1
                 return
-            if self._auto_ack:
-                self.ack_events(message.seq)
+            self._deliver_event(message)
+            return
         elif isinstance(message, CommandAck):
             with self._lock:
                 pending = self._pending.get(message.id)
@@ -472,5 +519,112 @@ class DeviceManager:
         if handler is not None:
             try:
                 handler(message)
+            except Exception:  # pragma: no cover
+                log.exception("fallo en el consumidor de mensajes")
+
+    # -- Sesiones ----------------------------------------------------------
+
+    def _start_session_if_needed(self, hello: Hello) -> None:
+        """Decide si el saludo abre una sesion nueva y reinicia el acuse.
+
+        Con `boot_id` la identidad es inequivoca. Con firmware antiguo no hay
+        forma de distinguir dos arranques: se reinicia el acuse en cada saludo
+        (at-least-once, puede duplicar) y se cuenta la sesion para que la
+        interfaz pueda avisar de que la deduplicacion no es fiable.
+        """
+        previous = self._boot_id
+        reason = "watchdog" if hello.cfg.get("wdt_rst") else "power"
+
+        if hello.boot_id is None:
+            # Firmware antiguo: sin identidad de sesion solo queda el instante
+            # de arranque, que vale ~0 y a menudo coincide entre arranques. Se
+            # mantiene la heuristica anterior (cambio de `boot`) y se cuenta la
+            # sesion para que la interfaz sepa que la deduplicacion no es fiable.
+            new_session = self.hello is None or hello.boot_ms != self.hello.boot_ms
+            if new_session:
+                self.stats.legacy_sessions += 1
+                log.warning(
+                    "firmware %s sin boot_id: la deduplicacion entre reconexiones "
+                    "no puede garantizarse",
+                    hello.fw,
+                )
+        else:
+            new_session = previous != hello.boot_id
+
+        if not new_session:
+            return
+
+        with self._lock:
+            self.last_seq_acked = 0
+            self._ack_target = 0
+            self._ack_dirty = False
+            self._replay_done = False
+        self._boot_id = hello.boot_id
+        self._last_up_ms = None
+        if previous is not None:
+            self.stats.reboots += 1
+            self._reboot_reason = reason
+            log.info(
+                "sesion nueva: boot_id=%s antes=%s motivo=%s",
+                hello.boot_id,
+                previous,
+                reason,
+            )
+        else:
+            self._reboot_reason = reason
+
+    def _track_uptime(self, up_ms: int) -> None:
+        """Detecta un reinicio que no vimos porque el puerto no se cerro.
+
+        `up` es el `millis()` de la placa: solo puede retroceder si la placa ha
+        vuelto a arrancar. Cuando pasa, el `seq` vuelve a 1 y el acuse anterior
+        descartaria todos los eventos nuevos, asi que hay que invalidar la
+        sesion y pedir el `hello` que trae el `boot_id` nuevo.
+        """
+        previous = self._last_up_ms
+        self._last_up_ms = up_ms
+        if previous is None or up_ms >= previous:
+            return
+        if up_ms > self._hb_ms:
+            # Bajar dentro de la ventana normal no es un reinicio: el `hb`
+            # puede llegar desordenado tras una reconexion.
+            return
+        if self._boot_id is None and not self._session_hello:
+            return
+        with self._lock:
+            self.last_seq_acked = 0
+            self._ack_target = 0
+            self._ack_dirty = False
+            self._replay_done = False
+            self._hello_pending = True
+        self._session_hello = False
+        self._boot_id = None
+        self.stats.reboots += 1
+        self._reboot_reason = "power"
+        log.warning("el latido retrocede a %d ms: la placa se ha reiniciado", up_ms)
+
+    def _drain_pre_hello(self) -> None:
+        """Despacha los eventos que llegaron antes del saludo."""
+        pending = self._pre_hello
+        self._pre_hello = []
+        for event in pending:
+            self._deliver_event(event)
+
+    def _deliver_event(self, event: MotionEvent) -> None:
+        """Entrega un evento ya atribuido a la sesion en curso."""
+        tagged = event if event.boot_id is not None else replace(event, boot_id=self._boot_id)
+        with self._lock:
+            already = tagged.seq <= self.last_seq_acked
+        if already:
+            # Reenvio de un evento ya procesado y confirmado. Se cuenta y no se
+            # entrega: el consumidor no debe registrar dos veces.
+            self.stats.duplicates += 1
+            return
+        if self._auto_ack:
+            self.ack_events(tagged.seq, tagged.boot_id)
+        handler = self.on_message
+        if handler is not None:
+            try:
+                handler(tagged)
             except Exception:  # pragma: no cover
                 log.exception("fallo en el consumidor de mensajes")

@@ -330,6 +330,41 @@ ajustar** sobreviven a **Recargar configuración** y al reinicio.
 Detalle de cada diálogo y de los iconos en
 [`doc/04-INTERFAZ.md`](doc/04-INTERFAZ.md).
 
+## Qué garantiza el registro y qué no
+
+Desde 0.1.4 un evento del sensor se confirma a la placa **solo después** de
+estar guardado: primero se intenta `data/alarm.db` y, si SQLite falla, se
+escribe una línea en `data/spool/events-AAAAMMDD.jsonl` con `fsync` antes de
+contestar. Si ninguna de las dos cosas funciona, **no hay acuse**: el evento se
+queda en el buffer de la placa y la ventana muestra un aviso rojo
+`REGISTRO NO PERSISTENTE` con los eventos pendientes. El spool se reimporta solo
+en cuanto la base vuelve a estar disponible, y la importación es idempotente.
+
+La deduplicación es por **`(boot_id, seq)`**. `boot_id` es un contador de 32
+bits que la placa guarda en EEPROM y anuncia en `hello`, así que un evento
+reenviado tras una reconexión no vuelve a disparar la alarma ni a mandar
+avisos, pero sí se vuelve a acusar. Un `seq=1` de un arranque nuevo se procesa
+aunque el arranque anterior también tuviera un `seq=1`. Con firmware 1.6.0, que
+no manda `boot_id`, el PC sigue trabajando en modo degradado y deduplica dentro
+de cada sesión.
+
+El estado de la alarma (armada, retardo pendiente, disparada, sirena sonando,
+silenciada, rearmes) se guarda en el mismo commit que el evento y se restaura al
+arrancar: si cierras la ventana con la alarma disparada, al volver la sirena
+retoma lo que le quedaba en vez de arrancar desarmada.
+
+Lo que **no** cubre:
+
+- El buffer de la placa tiene **16 eventos**. En un reset por watchdog o por
+  corte de alimentación se pierden los que no se hubieran acusado (los ya
+  guardados en el PC no se pierden). El `hello` lo reporta con `wdt_rst: 1` y el
+  contador `lost`, que la ventana anota en el registro.
+- Si el disco está lleno, la carpeta es de solo lectura **y** SQLite está
+  bloqueado, no se puede garantizar nada: no hay acuse y la ventana lo dice.
+- Un spool correcto no sustituye una prueba física: comprueba el sistema, pero
+  no garantiza que el PIR vea lo que debe ver. Para eso está el ajuste del
+  sensor.
+
 ## Uso diario en consola
 
 ```powershell
@@ -423,7 +458,7 @@ src/alarm/      Paquete Python
 tools/          CLI de operación, simulador y capturas de la interfaz
 scripts/        Utilidades de PowerShell (setup, build, flash, run)
 tests/          Pruebas (pytest, Qt en modo offscreen)
-data/           Historial (alarm.db), exportaciones y caché de voz (no versionado)
+data/           Historial (alarm.db), eventos en espera (spool/), exportaciones y caché de voz (no versionado)
 ```
 
 La interfaz no toca el puerto serie: el `DeviceManager` lee en su propio hilo y

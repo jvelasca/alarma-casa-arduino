@@ -85,6 +85,7 @@ def _decode_hello(d: Mapping[str, Any]) -> Hello:
         zones=tuple(zones),
         caps=caps,
         cfg=cfg,
+        boot_id=_opt(d, "boot_id", (int,), None),
     )
 
 

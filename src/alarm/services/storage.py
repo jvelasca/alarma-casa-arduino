@@ -20,8 +20,8 @@ import logging
 import sqlite3
 import threading
 import time
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,11 +44,28 @@ CREATE TABLE IF NOT EXISTS system_state (
     value      TEXT NOT NULL,
     updated_at REAL NOT NULL
 );
+-- Eventos del dispositivo ya procesados, con la clave que los hace unicos:
+-- el arranque de la placa (`boot_id`) y su numero de secuencia. Es lo que
+-- impide que un reenvio tras reconectar vuelva a alimentar la maquina de
+-- estados o a lanzar un segundo aviso. `boot_id` 0 se reserva para firmware
+-- antiguo, que no puede deduplicarse con garantias entre sesiones.
+CREATE TABLE IF NOT EXISTS processed_events (
+    boot_id INTEGER NOT NULL,
+    seq     INTEGER NOT NULL,
+    ts      REAL NOT NULL,
+    PRIMARY KEY (boot_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_processed_events_ts ON processed_events(ts);
 """
 
 # Cabeceras del CSV. Se mantienen en espanol porque el fichero es para leerlo,
 # no para que lo consuma otro programa.
 CSV_HEADER = ("fecha_local", "fecha_utc", "severidad", "evento", "detalle")
+
+# Cuanto se guarda la prueba de "este evento ya se proceso". Muy por encima de
+# cualquier reconexion real: una placa que vuelve a enviar un evento de hace un
+# mes ya no esta reenviando nada, esta contando otra cosa.
+_PROCESSED_RETENTION_S = 30 * 86_400
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,7 +248,11 @@ class EventStore:
 
         if self._path != ":memory:":
             Path(self._path).parent.mkdir(parents=True, exist_ok=True)
-        self._con = sqlite3.connect(self._path, check_same_thread=False)
+        # ``isolation_level=None`` desactiva el BEGIN implicito de sqlite3: las
+        # transacciones se abren y cierran aqui (`_transaction`), para que un
+        # fallo a mitad de una escritura pueda deshacerse explicitamente en vez
+        # de quedar pendiente hasta el siguiente commit ajeno.
+        self._con = sqlite3.connect(self._path, check_same_thread=False, isolation_level=None)
         with self._lock:
             self._con.executescript(_SCHEMA)
             # WAL deja leer mientras se escribe y aguanta mejor un corte de luz.
@@ -239,7 +260,23 @@ class EventStore:
                 self._con.execute("PRAGMA journal_mode=WAL")
             with suppress(sqlite3.Error):
                 self._con.execute("PRAGMA synchronous=NORMAL")
-            self._con.commit()
+
+    @contextmanager
+    def _transaction(self) -> Iterator[sqlite3.Connection]:
+        """Transaccion explicita: o se confirma entera o no queda nada.
+
+        ``BEGIN IMMEDIATE`` toma el cerrojo de escritura al empezar, de modo
+        que un historial bloqueado por otro programa falla antes de escribir la
+        primera fila y no a mitad. El llamador ya tiene ``self._lock``.
+        """
+        self._con.execute("BEGIN IMMEDIATE")
+        try:
+            yield self._con
+        except BaseException:
+            with suppress(sqlite3.Error):
+                self._con.execute("ROLLBACK")
+            raise
+        self._con.execute("COMMIT")
 
     # -- Escritura ---------------------------------------------------------
 
@@ -251,12 +288,11 @@ class EventStore:
             kind=kind,
             detail=detail,
         )
-        with self._lock:
+        with self._lock, self._transaction():
             self._con.execute(
                 "INSERT INTO log_entries (ts, tag, kind, detail) VALUES (?, ?, ?, ?)",
                 (row.ts, row.tag, row.kind, row.detail),
             )
-            self._con.commit()
             self._inserts += 1
         # Comprobar el tope en cada insercion costaria una consulta por evento;
         # cada 500 es imperceptible y acota el exceso.
@@ -264,6 +300,97 @@ class EventStore:
             with suppress(sqlite3.Error):
                 self.purge()
         return row
+
+    def record_motion(
+        self,
+        boot_id: int | None,
+        seq: int,
+        tag: str,
+        kind: str,
+        detail: str,
+        *,
+        ts: float | None = None,
+        state: Mapping[str, str] | None = None,
+        remove_state: Sequence[str] = (),
+    ) -> tuple[EventRow | None, bool]:
+        """Registra un evento del dispositivo de forma idempotente.
+
+        Devuelve ``(fila, nuevo)``. En una sola transaccion se apuntan tres
+        cosas: la clave ``(boot_id, seq)``, la fila del historial y, si se pasa,
+        el estado de la maquina de alarma resultante. O quedan las tres o no
+        queda ninguna, asi que no existe el estado intermedio en el que el
+        evento se ha procesado pero no se puede reconocer al repetirse, ni el
+        de un disparo registrado cuyo estado guardado aun dice "armada".
+
+        Si la clave ya estaba, ``fila`` es ``None`` y ``nuevo`` es ``False``: el
+        llamador debe volver a confirmar el evento pero no repetir sus efectos
+        (sirena, avisos, transicion de estado).
+
+        Con ``boot_id`` desconocido (firmware 1.6.0 o anterior) no se apunta la
+        clave: la sesion no se puede distinguir de otra y usarla como si lo
+        fuera descartaria eventos legitimos.
+        """
+        row = EventRow(
+            ts=self._clock() if ts is None else float(ts),
+            tag=tag,
+            kind=kind,
+            detail=detail,
+        )
+        with self._lock, self._transaction():
+            new = True
+            if boot_id is not None:
+                cursor = self._con.execute(
+                    "INSERT OR IGNORE INTO processed_events (boot_id, seq, ts) VALUES (?, ?, ?)",
+                    (int(boot_id), int(seq), row.ts),
+                )
+                new = cursor.rowcount > 0
+            if not new:
+                return None, False
+            self._con.execute(
+                "INSERT INTO log_entries (ts, tag, kind, detail) VALUES (?, ?, ?, ?)",
+                (row.ts, row.tag, row.kind, row.detail),
+            )
+            self._write_state(state, remove_state)
+            self._inserts += 1
+        if self._inserts % 500 == 0:
+            with suppress(sqlite3.Error):
+                self.purge()
+        return row, True
+
+    def _write_state(
+        self,
+        values: Mapping[str, str] | None,
+        remove: Sequence[str] = (),
+    ) -> None:
+        """Aplica cambios de ``system_state`` sin hacer commit.
+
+        Vive aparte para que ``record_motion`` y ``set_state_many`` compartan
+        la misma escritura y pueda formar parte de su transaccion.
+        """
+        if values:
+            moment = self._clock()
+            self._con.executemany(
+                "INSERT INTO system_state (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                "updated_at=excluded.updated_at",
+                [(str(key), str(value), moment) for key, value in values.items()],
+            )
+        if remove:
+            self._con.executemany(
+                "DELETE FROM system_state WHERE key = ?",
+                [(str(key),) for key in remove],
+            )
+
+    def has_processed(self, boot_id: int | None, seq: int) -> bool:
+        """Si ``(boot_id, seq)`` ya se proceso alguna vez."""
+        if boot_id is None:
+            return False
+        with self._lock:
+            row = self._con.execute(
+                "SELECT 1 FROM processed_events WHERE boot_id = ? AND seq = ?",
+                (int(boot_id), int(seq)),
+            ).fetchone()
+        return row is not None
 
     # -- Estado del sistema ------------------------------------------------
 
@@ -277,19 +404,39 @@ class EventStore:
 
     def set_state(self, key: str, value: str) -> None:
         """Guarda un valor que debe sobrevivir al reinicio (upsert)."""
-        with self._lock:
+        with self._lock, self._transaction():
             self._con.execute(
                 "INSERT INTO system_state (key, value, updated_at) VALUES (?, ?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
                 "updated_at=excluded.updated_at",
                 (key, value, self._clock()),
             )
-            self._con.commit()
 
     def clear_state(self, key: str) -> None:
-        with self._lock:
+        with self._lock, self._transaction():
             self._con.execute("DELETE FROM system_state WHERE key = ?", (key,))
-            self._con.commit()
+
+    def set_state_many(
+        self,
+        values: Mapping[str, str],
+        *,
+        remove: Sequence[str] = (),
+    ) -> None:
+        """Guarda y borra varias claves en un solo commit.
+
+        El estado de la alarma son varios datos que deben moverse juntos: si se
+        escribiera ``armed_intent`` y fallara el ``armed_at``, la proxima
+        apertura leeria una alarma armada sin fecha. Todo o nada.
+        """
+        if not values and not remove:
+            return
+        with self._lock, self._transaction():
+            self._write_state(values, remove)
+
+    @property
+    def persistent(self) -> bool:
+        """``False`` si el historial vive en memoria y no sobrevive al cierre."""
+        return self._path != ":memory:"
 
     # -- Lectura -----------------------------------------------------------
 
@@ -317,14 +464,17 @@ class EventStore:
 
     def clear(self) -> None:
         """Vacia el historial. Lo pide «Limpiar registro» y es irreversible."""
-        with self._lock:
+        with self._lock, self._transaction():
             self._con.execute("DELETE FROM log_entries")
-            self._con.commit()
 
     def purge(self) -> int:
         """Aplica los dos limites y compacta si ha borrado mucho."""
         oldest = self._clock() - self._max_age_s
-        with self._lock:
+        # Las claves de eventos procesados se guardan mucho mas tiempo que la
+        # retencion visible: son la prueba de que un reenvio ya se atendio y
+        # perderlas antes de tiempo volveria a duplicar una intrusion antigua.
+        processed_oldest = self._clock() - _PROCESSED_RETENTION_S
+        with self._lock, self._transaction():
             removed = self._con.execute("DELETE FROM log_entries WHERE ts < ?", (oldest,)).rowcount
             # OFFSET max_events deja fuera lo que sobra: se borra todo lo anterior.
             excess = self._con.execute(
@@ -333,12 +483,12 @@ class EventStore:
                 ")",
                 (self._max_events,),
             ).rowcount
+            self._con.execute("DELETE FROM processed_events WHERE ts < ?", (processed_oldest,))
             total = max(0, removed) + max(0, excess)
-            self._con.commit()
-            if total > 1_000:
-                # VACUUM no se puede ejecutar dentro de una transaccion.
-                with suppress(sqlite3.Error):
-                    self._con.execute("VACUUM")
+        if total > 1_000:
+            # VACUUM no se puede ejecutar dentro de una transaccion.
+            with suppress(sqlite3.Error):
+                self._con.execute("VACUUM")
         if total:
             log.info("historial purgado: %d filas fuera de retencion", total)
         return total

@@ -15,6 +15,93 @@ sigue [Keep a Changelog](https://keepachangelog.com/es/1.1.0/) y la numeración
 
 - Zonas, panel web y bandeja del sistema (F2-F3 de la hoja de ruta).
 
+## [0.1.4] — 2026-11-13
+
+Corrige de verdad los tres hallazgos que 0.1.3 daba por cerrados (H-01, H-02 y
+H-03). La entrada de 0.1.3 afirma que los reenvíos se descartaban por
+`(boot, seq)`; eso **no estaba implementado**: el único filtro era
+`seq <= last_seq_acked`, se reiniciaba en cada apertura de puerto y `boot` valía
+~0 en todos los arranques. No había identidad de sesión, el ACK se daba aunque
+SQLite fallara y la máquina de estados solo recuperaba `ARMADA`/`DESARMADA`.
+Esta versión lo sustituye por completo.
+
+### Corregido
+
+- **H-01 — el ACK exige una escritura durable.** La ruta de `MotionEvent` ya no
+  pasa por `_log_event()`: `_handle_motion()` intenta una transacción en SQLite
+  (evento + clave + snapshot de la FSM) y, si falla, escribe el mismo registro en
+  un buzón JSONL con `flush()` + `os.fsync()`. Solo entonces aplica los efectos
+  y confirma a la placa. Si ni la base ni el buzón aceptan la escritura **no hay
+  ACK**: la placa conserva el evento en su buffer y lo reenvía.
+- **H-02 — identidad de arranque real en la EEPROM.** El firmware 1.7.0 guarda
+  un contador `boot_id` de 32 bits en dos ranuras alternas con magic y CRC16 y lo
+  anuncia en el `hello`. Se escribe una vez por arranque, nunca en `loop()`.
+  Python compone `(boot_id, seq)` y la apunta en la nueva tabla
+  `processed_events`: un reenvío del mismo evento se vuelve a confirmar pero no
+  alimenta otra vez la FSM ni lanza un segundo aviso. Un `seq=1` de un arranque
+  nuevo se procesa aunque el anterior también tuviera `seq=1`.
+- **H-02 — el gestor distingue sesiones.** Sin `boot_id` (firmware 1.6.0 o
+  anterior) se conserva la heurística por `boot` y se marca la sesión como no
+  fiable. Con él, abrir el puerto ya no reinicia el acuse "por si acaso": lo
+  reinicia el `hello` cuando el `boot_id` es otro, y lo pide `replay` una vez por
+  sesión. Un `hb.up_ms` que retrocede delata un reinicio por watchdog que no se
+  vio y fuerza un `hello` nuevo. Los eventos que llegan antes del saludo se
+  aparcan y se despachan con la identidad correcta.
+- **H-02 — el ACK viaja con su sesión.** `ack_events(seq, boot_id)` ignora
+  acuses de una sesión que ya no es la actual: si la placa se reinició entre
+  procesar y confirmar, confirmar el `seq` viejo borraría eventos de la sesión
+  nueva.
+- **H-03 — la FSM se recupera entera, no solo armada/desarmada.** `to_snapshot()`
+  y `from_snapshot()` cubren los seis estados y guardan los plazos que quedaban.
+  Al arrancar se descuenta el tiempo que estuvo cerrada la aplicación: un
+  `PENDING` que venció mientras el PC estaba apagado pasa a `TRIGGERED`; un
+  `ARMING` o un `REARMING` vencidos pasan a `ARMED`; un `TRIGGERED` sigue
+  disparado y la sirena se reanuda con el tiempo que le quedaba, no con uno
+  nuevo entero.
+- **H-03 — el estado se marca como guardado solo tras el commit.** El snapshot
+  se escribe junto a `armed_intent` y `armed_at` en un único
+  `set_state_many()`. Si el commit falla no se actualiza la huella en memoria, de
+  modo que el siguiente cambio lo vuelve a intentar en vez de dar por bueno un
+  estado que no está en disco.
+
+### Añadido
+
+- **Buzón durable (`data/spool/`).** Ficheros JSONL por día con `fsync`,
+  reimportación idempotente al arrancar y cuarentena `.bad` para un fichero
+  corrupto. No sustituye a la prueba física: solo cubre el caso de SQLite
+  bloqueado, disco lleno o carpeta de solo lectura.
+- **Aviso permanente de registro no persistente.** La tarjeta del dispositivo
+  muestra `REGISTRO NO PERSISTENTE` con el motivo (historial en memoria, base
+  bloqueada, eventos en el buzón o eventos sin guardar) mientras dure.
+- **`fw 1.7.0`**: `boot_id` en EEPROM y en el `hello`. `FW_VERSION` sube.
+
+### Endurecido durante la auditoría de la propia 0.1.4
+
+Revisando el código con la lista de comprobaciones en la mano aparecieron dos
+agujeros que esta misma entrada cierra, antes de publicar:
+
+- **Transacciones explícitas con `ROLLBACK`.** `EventStore` abre y cierra sus
+  escrituras con `BEGIN IMMEDIATE`/`COMMIT` en vez de confiar en el `BEGIN`
+  implícito de `sqlite3`. Si el `INSERT` del historial o del estado fallaba a
+  mitad, la clave de `processed_events` quedaba pendiente en la conexión y el
+  siguiente commit ajeno la confirmaba: el evento se daba por procesado sin
+  estar guardado y su reenvío se descartaba como duplicado.
+- **El buzón tolera una línea a medias.** Un corte durante la escritura deja el
+  fichero sin salto final; el `append` siguiente separa con un salto para no
+  pegarse al fragmento roto (antes el registro nuevo quedaba dentro de la línea
+  inválida y se perdía). En la reimportación, las líneas buenas entran al
+  historial y solo las rotas se apartan en el `.bad`, que se acumula en vez de
+  pisarse: antes un solo byte malo dejaba fuera todos los eventos del fichero.
+
+
+### Notas de compatibilidad
+
+- Con firmware 1.6.0 la aplicación sigue funcionando, pero la deduplicación entre
+  reconexiones no puede garantizarse (no hay identidad de sesión). Se avisa en el
+  registro.
+- La base de datos gana la tabla `processed_events`; se crea sola, no hay
+  migración que ejecutar.
+
 ## [0.1.3] — 2026-11-13
 
 Cierre de los cinco hallazgos de prioridad alta y media de la auditoría externa
@@ -142,7 +229,8 @@ Mega como sensor y la aplicación de escritorio como central.
 - **Pruebas y calidad** — 501 pruebas de `pytest`, `ruff` y `mypy` en modo
   estricto, comprobados en integración continua.
 
-[Sin publicar]: https://github.com/jvelasca/alarma-casa-arduino/compare/v0.1.3...HEAD
+[Sin publicar]: https://github.com/jvelasca/alarma-casa-arduino/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/jvelasca/alarma-casa-arduino/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/jvelasca/alarma-casa-arduino/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/jvelasca/alarma-casa-arduino/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/jvelasca/alarma-casa-arduino/compare/v0.1.0...v0.1.1

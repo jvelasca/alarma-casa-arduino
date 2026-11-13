@@ -11,6 +11,7 @@ Lo que importa no es que SQLite funcione, sino que:
 from __future__ import annotations
 
 import csv
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -292,3 +293,204 @@ def test_escribir_csv_suelta_las_filas_que_le_dan(tmp_path: Path) -> None:
     assert leidas[1][2] == "triggered"
     assert leidas[1][3] == "Alarma disparada"
     assert write_csv(tmp_path / "vacio.csv", []) == 0
+
+
+# ---------------------------------------------------------------------------
+# Deduplicacion de eventos por sesion de arranque
+# ---------------------------------------------------------------------------
+
+
+def test_record_motion_es_idempotente_por_boot_y_seq(tmp_path: Path) -> None:
+    """H-02: el mismo (boot_id, seq) no puede crear dos filas."""
+    store = _abrir(tmp_path / "alarm.db")
+    try:
+        fila, nuevo = store.record_motion(7, 1, "start", "Movimiento", "Detección")
+        assert nuevo is True
+        assert fila is not None
+
+        repetida, nuevo_otra_vez = store.record_motion(7, 1, "start", "Movimiento", "Detección")
+        assert nuevo_otra_vez is False
+        assert repetida is None
+        assert store.count() == 1
+        assert store.has_processed(7, 1) is True
+    finally:
+        store.close()
+
+
+def test_el_mismo_seq_de_otro_arranque_es_otro_evento(tmp_path: Path) -> None:
+    store = _abrir(tmp_path / "alarm.db")
+    try:
+        assert store.record_motion(7, 1, "start", "Movimiento", "a")[1] is True
+        assert store.record_motion(8, 1, "start", "Movimiento", "b")[1] is True
+        assert store.count() == 2
+        assert store.has_processed(7, 1)
+        assert store.has_processed(8, 1)
+    finally:
+        store.close()
+
+
+def test_sin_boot_id_no_se_apunta_la_clave(tmp_path: Path) -> None:
+    """Firmware 1.6.0: no hay identidad de sesion, solo se guarda la fila."""
+    store = _abrir(tmp_path / "alarm.db")
+    try:
+        assert store.record_motion(None, 1, "start", "Movimiento", "a")[1] is True
+        assert store.record_motion(None, 1, "start", "Movimiento", "a")[1] is True
+        assert store.count() == 2
+        assert store.has_processed(None, 1) is False
+    finally:
+        store.close()
+
+
+def test_el_estado_se_guarda_en_la_misma_transaccion_que_el_evento(
+    tmp_path: Path,
+) -> None:
+    store = _abrir(tmp_path / "alarm.db")
+    try:
+        store.record_motion(
+            1,
+            1,
+            "start",
+            "Movimiento",
+            "Detección",
+            state={"armed_intent": "true", "alarm_snapshot": "{}"},
+            remove_state=("armed_at",),
+        )
+        assert store.get_state("armed_intent") == "true"
+        assert store.get_state("alarm_snapshot") == "{}"
+        assert store.get_state("armed_at") is None
+    finally:
+        store.close()
+
+
+def test_el_duplicado_no_pisa_el_estado_guardado(tmp_path: Path) -> None:
+    """Un reenvio no puede deshacer una transicion posterior."""
+    store = _abrir(tmp_path / "alarm.db")
+    try:
+        store.record_motion(1, 1, "start", "Movimiento", "a", state={"alarm_snapshot": "viejo"})
+        store.set_state("alarm_snapshot", "nuevo")
+        store.record_motion(1, 1, "start", "Movimiento", "a", state={"alarm_snapshot": "viejo"})
+        assert store.get_state("alarm_snapshot") == "nuevo"
+    finally:
+        store.close()
+
+
+def test_purge_limpia_las_claves_de_eventos_procesados(tmp_path: Path) -> None:
+    store = _abrir(tmp_path / "alarm.db")
+    try:
+        # Marca de tiempo muy antigua: fuera de la ventana de 30 dias.
+        store.record_motion(1, 1, "start", "Movimiento", "a", ts=0.0)
+        store.purge()
+        assert store.has_processed(1, 1) is False
+    finally:
+        store.close()
+
+
+def test_set_state_many_escribe_todo_o_nada(tmp_path: Path) -> None:
+    store = _abrir(tmp_path / "alarm.db")
+    try:
+        store.set_state_many(
+            {"armed_intent": "true", "armed_at": "1700000000"},
+            remove=("otra",),
+        )
+        assert store.get_state("armed_intent") == "true"
+        assert store.get_state("armed_at") == "1700000000"
+        assert store.get_state("otra") is None
+    finally:
+        store.close()
+
+
+def test_persistent_distingue_memoria_de_disco(tmp_path: Path) -> None:
+    en_memoria = EventStore(":memory:")
+    en_disco = _abrir(tmp_path / "alarm.db")
+    try:
+        assert en_memoria.persistent is False
+        assert en_disco.persistent is True
+    finally:
+        en_memoria.close()
+        en_disco.close()
+
+
+# ---------------------------------------------------------------------------
+# Atomicidad real: un fallo a mitad no puede dejar media transaccion
+# ---------------------------------------------------------------------------
+
+
+def test_un_fallo_al_insertar_la_fila_no_deja_la_clave_procesada(tmp_path: Path) -> None:
+    """La clave y la fila van juntas: si la fila falla, la clave se deshace.
+
+    Sin el ROLLBACK explicito la clave quedaba pendiente en la conexion y el
+    siguiente commit ajeno la confirmaba: el evento se daba por procesado sin
+    estar en el historial, y su reenvio se descartaba como duplicado.
+    """
+    store = _abrir(tmp_path / "alarm.db")
+    try:
+        store._con.execute(  # noqa: SLF001 - se fuerza el fallo desde la prueba
+            "CREATE TRIGGER no_log BEFORE INSERT ON log_entries "
+            "BEGIN SELECT RAISE(ABORT, 'disco lleno'); END"
+        )
+        with pytest.raises(sqlite3.DatabaseError):
+            store.record_motion(1, 1, "start", "Movimiento", "a", state={"armed_intent": "true"})
+
+        assert store.has_processed(1, 1) is False, "la clave no puede sobrevivir al fallo"
+        assert store.get_state("armed_intent") is None
+
+        # Otro commit cualquiera no puede resucitar la clave pendiente.
+        store.set_state("otra", "1")
+        assert store.has_processed(1, 1) is False
+
+        # Y la conexion sigue usable: se puede volver a intentar el evento.
+        store._con.execute("DROP TRIGGER no_log")  # noqa: SLF001
+        fila, nuevo = store.record_motion(1, 1, "start", "Movimiento", "a")
+        assert nuevo is True
+        assert fila is not None
+        assert store.count() == 1
+    finally:
+        store.close()
+
+
+def test_set_state_many_no_deja_escrituras_parciales(tmp_path: Path) -> None:
+    store = _abrir(tmp_path / "alarm.db")
+    try:
+        store._con.execute(  # noqa: SLF001
+            "CREATE TRIGGER no_estado BEFORE INSERT ON system_state "
+            "WHEN NEW.key = 'armed_at' BEGIN SELECT RAISE(ABORT, 'disco lleno'); END"
+        )
+        with pytest.raises(sqlite3.DatabaseError):
+            store.set_state_many({"armed_intent": "true", "armed_at": "1700000000"})
+
+        assert store.get_state("armed_intent") is None, "no puede quedar media escritura"
+        assert store.get_state("armed_at") is None
+    finally:
+        store.close()
+
+
+def test_una_base_de_la_version_anterior_se_migra_sola(tmp_path: Path) -> None:
+    """0.1.3 no tenia `processed_events`: abrir la base tiene que anadirla."""
+    import sqlite3 as driver
+
+    path = tmp_path / "alarm.db"
+    vieja = driver.connect(path)
+    try:
+        vieja.executescript(
+            "CREATE TABLE log_entries ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, "
+            "  tag TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL);"
+            "CREATE TABLE system_state ("
+            "  key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL NOT NULL);"
+            "INSERT INTO log_entries (ts, tag, kind, detail) "
+            "VALUES (1700000000.0, 'info', 'De 0.1.3', 'fila antigua');"
+            "INSERT INTO system_state VALUES ('armed_intent', 'false', 1700000000.0);"
+        )
+        vieja.commit()
+    finally:
+        vieja.close()
+
+    store = _abrir(path)
+    try:
+        assert store.count() == 1, "las filas antiguas se conservan"
+        assert store.recent(1)[0].kind == "De 0.1.3"
+        assert store.get_state("armed_intent") == "false"
+        assert store.record_motion(4, 1, "start", "Movimiento", "nueva")[1] is True
+        assert store.has_processed(4, 1) is True
+    finally:
+        store.close()

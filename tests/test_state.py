@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from alarm.core.state import (
     ACTION_ARMED,
     ACTION_ARMING,
@@ -484,3 +486,220 @@ def test_set_rearm_no_toca_la_espera_en_curso() -> None:
     controller.set_rearm(auto_rearm=True, rearm_delay_s=1, max_rearms=9)
     assert controller.remaining_s() == 300, "el plazo abierto no se recorta a mitad"
     assert controller.rearm_max == 9
+
+
+# ---------------------------------------------------------------------------
+# Snapshot: recuperar la alarma tal y como estaba
+# ---------------------------------------------------------------------------
+
+_CONFIG: dict[str, object] = {
+    "exit_delay_s": 0,
+    "entry_delay_s": 30,
+    "auto_rearm": True,
+    "rearm_delay_s": 300,
+    "max_rearms": 2,
+    "siren_s": 180,
+}
+
+
+def _opciones(**kwargs: object) -> dict[str, object]:
+    options = dict(_CONFIG)
+    options.update(kwargs)
+    return options
+
+
+def _controlador(now: list[float], **kwargs: object) -> AlarmController:
+    return AlarmController(clock=lambda: now[0], **_opciones(**kwargs))  # type: ignore[arg-type]
+
+
+def _en_estado(state: AlarmState, now: list[float]) -> AlarmController:
+    """Controlador colocado en `state` con un reloj falso."""
+    if state is AlarmState.ARMING:
+        controller = _controlador(now, exit_delay_s=45)
+        controller.arm()
+        now[0] += 10
+    elif state is AlarmState.REARMING:
+        controller = _controlador(now, entry_delay_s=0)
+        controller.arm()
+        controller.feed(_start())
+        now[0] += 180
+        controller.tick()
+        now[0] += 20
+    elif state is AlarmState.PENDING:
+        controller = _controlador(now)
+        controller.arm()
+        controller.feed(_start())
+        now[0] += 5
+    elif state is AlarmState.TRIGGERED:
+        controller = _controlador(now, entry_delay_s=0)
+        controller.arm()
+        controller.feed(_start())
+        now[0] += 10
+    elif state is AlarmState.ARMED:
+        controller = _controlador(now)
+        controller.arm()
+    else:
+        controller = _controlador(now)
+    assert controller.state is state
+    return controller
+
+
+@pytest.mark.parametrize("state", list(AlarmState))
+def test_el_snapshot_va_y_vuelve_para_cada_estado(state: AlarmState) -> None:
+    now = [100.0]
+    original = _en_estado(state, now)
+    snapshot = original.to_snapshot()
+
+    restaurado = AlarmController.from_snapshot(
+        snapshot,
+        clock=lambda: now[0],
+        **_opciones(),  # type: ignore[arg-type]
+    )
+
+    assert restaurado.state is state
+    assert restaurado.armed is original.armed
+    assert restaurado.silenced == original.silenced
+    assert restaurado.rearm_count == original.rearm_count
+    if original.remaining_s() is None:
+        assert restaurado.remaining_s() is None
+    else:
+        assert restaurado.remaining_s() == pytest.approx(original.remaining_s(), abs=0.01)
+        assert restaurado.delay_total_s == pytest.approx(original.delay_total_s, abs=0.01)
+    if original.siren_remaining_s() is None:
+        assert restaurado.siren_remaining_s() is None
+    else:
+        assert restaurado.siren_remaining_s() == pytest.approx(
+            original.siren_remaining_s(), abs=0.01
+        )
+
+
+def test_un_retardo_de_entrada_vencido_dispara_al_recuperar() -> None:
+    """Cerrar el PC en PENDING y volver tarde no puede reabrir el plazo."""
+    now = [0.0]
+    controller = _controlador(now)
+    controller.arm()
+    controller.feed(_start())
+    now[0] += 5
+    snapshot = controller.to_snapshot()
+
+    restaurado = AlarmController.from_snapshot(
+        snapshot,
+        elapsed_s=600,
+        clock=lambda: now[0],
+        **_opciones(),  # type: ignore[arg-type]
+    )
+    assert restaurado.state is AlarmState.PENDING
+    transition = restaurado.tick()
+    assert transition is not None
+    assert transition.action == ACTION_TRIGGERED
+    assert restaurado.state is AlarmState.TRIGGERED
+
+
+def test_un_retardo_de_salida_vencido_arma_al_recuperar() -> None:
+    now = [0.0]
+    controller = _controlador(now, exit_delay_s=45)
+    controller.arm()
+    now[0] += 10
+    snapshot = controller.to_snapshot()
+
+    restaurado = AlarmController.from_snapshot(
+        snapshot,
+        elapsed_s=600,
+        clock=lambda: now[0],
+        **_opciones(exit_delay_s=45),  # type: ignore[arg-type]
+    )
+    transition = restaurado.tick()
+    assert transition is not None
+    assert transition.action == ACTION_ARMED
+    assert restaurado.state is AlarmState.ARMED
+
+
+def test_una_espera_de_rearme_vencida_vuelve_a_vigilar() -> None:
+    now = [0.0]
+    controller = _controlador(now, entry_delay_s=0)
+    controller.arm()
+    controller.feed(_start())
+    now[0] += 180
+    controller.tick()
+    now[0] += 20
+    assert controller.state is AlarmState.REARMING
+    snapshot = controller.to_snapshot()
+
+    restaurado = AlarmController.from_snapshot(
+        snapshot,
+        elapsed_s=600,
+        clock=lambda: now[0],
+        **_opciones(),  # type: ignore[arg-type]
+    )
+    transition = restaurado.tick()
+    assert transition is not None
+    assert transition.action == ACTION_REARMED
+    assert restaurado.state is AlarmState.ARMED
+
+
+def test_recuperar_un_disparo_conserva_el_tiempo_de_sirena() -> None:
+    now = [0.0]
+    controller = _controlador(now, entry_delay_s=0)
+    controller.arm()
+    controller.feed(_start())
+    now[0] += 30
+    snapshot = controller.to_snapshot()
+
+    restaurado = AlarmController.from_snapshot(
+        snapshot,
+        elapsed_s=0,
+        clock=lambda: now[0],
+        **_opciones(),  # type: ignore[arg-type]
+    )
+    assert restaurado.state is AlarmState.TRIGGERED
+    assert restaurado.siren_remaining_s() == pytest.approx(150, abs=0.01)
+    assert restaurado.tick() is None, "aun le queda sirena"
+
+
+def test_recuperar_un_disparo_con_la_sirena_vencida_rearma() -> None:
+    now = [0.0]
+    controller = _controlador(now, entry_delay_s=0)
+    controller.arm()
+    controller.feed(_start())
+    now[0] += 10
+    snapshot = controller.to_snapshot()
+
+    restaurado = AlarmController.from_snapshot(
+        snapshot,
+        elapsed_s=200,
+        clock=lambda: now[0],
+        **_opciones(),  # type: ignore[arg-type]
+    )
+    transition = restaurado.tick()
+    assert transition is not None
+    assert transition.action == ACTION_REARMING
+    assert restaurado.state is AlarmState.REARMING
+
+
+def test_el_snapshot_conserva_silenciada_y_rearmes() -> None:
+    now = [0.0]
+    controller = _controlador(now, entry_delay_s=0)
+    controller.arm()
+    controller.feed(_start())
+    controller.silence()
+    now[0] += 10
+
+    snapshot = controller.to_snapshot()
+    restaurado = AlarmController.from_snapshot(
+        snapshot,
+        clock=lambda: now[0],
+        **_opciones(),  # type: ignore[arg-type]
+    )
+
+    assert restaurado.state is AlarmState.TRIGGERED
+    assert restaurado.silenced is True
+    assert restaurado.rearm_count == controller.rearm_count
+
+
+def test_un_estado_guardado_ilegible_arranca_desarmado() -> None:
+    restaurado = AlarmController.from_snapshot(
+        {"state": "inventado"},
+        **_opciones(),  # type: ignore[arg-type]
+    )
+    assert restaurado.state is AlarmState.DISARMED
+    assert restaurado.armed is False

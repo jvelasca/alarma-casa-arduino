@@ -11,6 +11,7 @@ dialogos y menus, no en la pantalla principal.
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import threading
@@ -19,6 +20,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from PyQt6.QtCore import QSize, Qt, QTimer
 from PyQt6.QtGui import QAction, QCloseEvent, QKeySequence
@@ -77,6 +79,7 @@ from ..core.state import (
     ACTION_REARMING,
     ACTION_SILENCED,
     ACTION_TRIGGERED,
+    SNAPSHOT_VERSION,
     AlarmController,
     AlarmState,
     Transition,
@@ -106,6 +109,7 @@ from ..services.ntfy_commands import (
 )
 from ..services.ntfy_sender import NtfyChannel
 from ..services.sms_sender import build_sms_channel
+from ..services.spool import EventSpool, SpoolRecord
 from ..services.storage import EventStore
 from ..services.tts import SpeechService
 from ..settings_store import save_local
@@ -129,6 +133,11 @@ from .widgets import Card, EventLog, IconButton, StateHero, tip
 log = logging.getLogger(__name__)
 
 APP_TITLE = "Alarma de presencia — Arduino Mega 2560"
+
+#: Tope del tiempo que se descuenta de los plazos al recuperar el estado. Un
+#: cambio de hora o un reloj mal puesto no debe reabrir un retardo de entrada
+#: que ya vencio; pasado un dia, cualquier plazo pendiente se da por vencido.
+_MAX_RESTORE_GAP_S = 86_400.0
 
 _HEALTH_STYLE: dict[Health, tuple[str, str]] = {
     Health.ONLINE: ("Conectado", theme.OK),
@@ -252,6 +261,7 @@ class MainWindow(QMainWindow):
         local_path: Path | None = None,
         env_path: Path | None = None,
         history_path: Path | str | None = None,
+        spool_dir: Path | str | None = None,
     ) -> None:
         super().__init__()
         self._baud = baud
@@ -296,28 +306,41 @@ class MainWindow(QMainWindow):
         self._config = config if config is not None else default_config()
 
         # El almacen se abre antes de crear el controlador: si la aplicacion se
-        # cerro armada, ese estado manda sobre `armed_on_start`. Crear primero
-        # el controlador obligaba a arrancar desarmada y rearmar despues, con
-        # el hueco de desproteccion que eso deja.
+        # cerro a mitad de un retardo o con la sirena sonando, ese estado manda
+        # sobre `armed_on_start`. Crear primero el controlador obligaba a
+        # arrancar desarmada y rearmar despues, con el hueco de desproteccion
+        # que eso deja.
         self._store = self._open_store(history_path)
+        # Buzon durable: segunda linea de defensa cuando SQLite no puede
+        # escribir. Se drena al arrancar para recuperar lo que quedo a medias.
+        # Su sitio por defecto acompaña al historial, para que una base de
+        # pruebas no llene el buzon real.
+        if spool_dir is None:
+            if history_path is not None:
+                spool_dir = Path(history_path).parent / "spool"
+            else:
+                spool_dir = STORAGE_ROOT / "spool"
+        self._spool = EventSpool(spool_dir)
+        self._spool.refresh()
         self._restored_armed_at: float | None = None
-        armed_on_start = self._resolve_armed_on_start()
+        self._restored_state: AlarmState | None = None
+        self._armed_at: float | None = None
 
-        self._controller = AlarmController(
-            armed_on_start=armed_on_start,
-            cooldown_s=self._config.alarm.cooldown_s,
-            max_per_hour=self._config.alarm.max_per_hour,
-            exit_delay_s=self._config.alarm.exit_delay_s,
-            entry_delay_s=self._config.alarm.entry_delay_s,
-            auto_rearm=self._config.alarm.auto_rearm,
-            rearm_delay_s=self._config.alarm.rearm_delay_s,
-            max_rearms=self._config.alarm.max_rearms,
-            siren_s=self._config.buzzer.siren_ms / 1000,
-        )
+        self._controller = self._build_controller()
         # Se guarda el estado efectivo ya al arrancar, para que la proxima
-        # apertura no dependa de que este sea el primer armado.
+        # apertura no dependa de que este sea el primer armado. La huella evita
+        # reescribir el disco en cada tic cuando nada ha cambiado.
         self._persisted_armed: bool | None = None
-        self._persist_armed_state()
+        self._state_fingerprint: tuple[bool, str] | None = None
+        self._persist_alarm_state()
+        # Un almacen en memoria no sobrevive al cierre: la ventana lo dice de
+        # forma permanente en vez de dar por buena una recuperacion que no
+        # existe.
+        self._storage_degraded = not self._store.persistent
+        self._unsaved_events = 0
+        self._spool_recovered = 0
+        if self._store.persistent:
+            self._spool_recovered = self._drain_spool()
         # Ultimo sufijo de disponibilidad pintado, para no repintar el hero en
         # cada refresco de 500 ms cuando no cambia nada.
         self._availability = ""
@@ -361,12 +384,21 @@ class MainWindow(QMainWindow):
         set_enabled(self._config.ui.beeps)
         self._log.set_limit(self._config.log.visible_rows)
         self._load_history()
-        if self._restored_armed_at is not None:
-            when = time.strftime("%d/%m/%Y %H:%M", time.localtime(self._restored_armed_at))
+        if self._restored_state is not None:
+            label = self._config.ui.label(self._state_key())
+            if self._restored_armed_at is not None:
+                when = time.strftime("%d/%m/%Y %H:%M", time.localtime(self._restored_armed_at))
+                detail = f"Estado recuperado: {label} desde {when}"
+            else:
+                detail = f"Estado recuperado: {label}"
             # La fila deja constancia de que la alarma no arranco desarmada:
             # quien lea el historial no debe pensar que el estado es de fabrica.
+            self._log_event("warning", "Estado recuperado", detail)
+        if self._spool_recovered:
             self._log_event(
-                "warning", "Estado recuperado", f"Estado recuperado: ARMADA desde {when}"
+                "warning",
+                "Buzón",
+                f"{self._spool_recovered} evento(s) del buzón reimportados al historial",
             )
         if self._store_error:
             self._log_event(
@@ -382,6 +414,17 @@ class MainWindow(QMainWindow):
                 "Datos",
                 f"la carpeta del ejecutable no admite escritura; configuración e historial "
                 f"en {STORAGE_ROOT}",
+            )
+        self._update_storage_warning()
+        if self._restored_state is AlarmState.TRIGGERED and not self._controller.silenced:
+            # La aplicacion se cerro con la alarma disparada: al volver, la
+            # sirena la reanuda el primer `hello` y el aviso sale ahora, no
+            # solo como una fila de historial.
+            self._notify(
+                "triggered",
+                "Alarma disparada (recuperada)",
+                "La aplicación se cerró con la alarma disparada y sigue activa.",
+                ignore_gate=True,
             )
 
         self._timer = QTimer(self)
@@ -912,6 +955,21 @@ class MainWindow(QMainWindow):
             "detectar movimiento ni avisar.",
         )
         card.add(self._device_warning)
+
+        # Aviso permanente de almacenamiento degradado: un historial en memoria
+        # o un buzon con eventos pendientes no es lo mismo que un registro
+        # fiable, y el usuario tiene que poder verlo sin abrir un menu.
+        self._storage_warning = QLabel("")
+        self._storage_warning.setStyleSheet(f"color: {theme.WARN}; font-weight: 700;")
+        self._storage_warning.setWordWrap(True)
+        self._storage_warning.setVisible(False)
+        tip(
+            self._storage_warning,
+            "El historial no se está guardando en la base de datos. Los eventos se "
+            "confirman solo si quedan en el buzón durable; si tampoco se puede escribir "
+            "allí, la placa los conserva y los reenvía.",
+        )
+        card.add(self._storage_warning)
 
         self._sensor = SensorPanel()
         card.add(self._sensor, stretch=1)
@@ -1501,7 +1559,13 @@ class MainWindow(QMainWindow):
             return
         self._apply_transition(transition)
 
-    def _apply_transition(self, transition: Transition, *, alert_now: bool = False) -> None:
+    def _apply_transition(
+        self,
+        transition: Transition,
+        *,
+        alert_now: bool = False,
+        already_persisted: bool = False,
+    ) -> None:
         self._paint_alarm()
         change = (
             f"{self._config.ui.label(_STATE_KEYS[transition.previous])} → "
@@ -1551,7 +1615,10 @@ class MainWindow(QMainWindow):
         # asi el zumbador local deja de pitar aunque el USB vaya con retraso.
         self._sync_device_armed()
         # Y el estado logico se persiste para que un reinicio no desarme nada.
-        self._persist_armed_state()
+        # Cuando la transicion la provoco un evento del sensor, su transaccion
+        # ya guardo el snapshot: repetirlo solo gastaria disco.
+        if not already_persisted:
+            self._persist_alarm_state()
 
         hour = time.strftime("%H:%M:%S")
         if transition.action == ACTION_ARMING:
@@ -1692,6 +1759,13 @@ class MainWindow(QMainWindow):
         if self._controller.state is not AlarmState.TRIGGERED:
             return
         if self._controller.silenced:
+            return
+        remaining = self._controller.siren_remaining_s()
+        if remaining is not None:
+            # La alarma se recupero de un cierre o la placa se reinicio a mitad
+            # del disparo: le queda a la sirena el tiempo del disparo original,
+            # no uno nuevo entero.
+            self._device_beep("alarm", max(0, int(remaining * 1000)), force=True)
             return
         self._device_beep("alarm", self._config.buzzer.siren_ms, force=True)
         # La placa vuelve a pitar el patron completo: el plazo del rearme se
@@ -2471,43 +2545,151 @@ class MainWindow(QMainWindow):
                 )
 
         elif isinstance(message, MotionEvent):
-            self._events += 1
-            self._events_label.setText(str(self._events))
-            if message.kind is MotionKind.START:
-                self._pulses += 1
-                self._pulses_label.setText(str(self._pulses))
-                self._paint_sensor(True)
-                self._log_event("start", "Movimiento", "Detección iniciada")
-                transition = self._controller.feed(message)
-                if transition is not None:
-                    self._apply_transition(transition)
-            elif message.kind is MotionKind.END:
-                self._paint_sensor(False)
-                duration = f"{message.dur_ms} ms" if message.dur_ms else "—"
-                self._log_event("end", "Fin de pulso", f"duración {duration}")
-            else:
-                self._log_event("bounce", "Rebote", "Flanco descartado por antirrebote")
-            # Solo ahora, con el evento ya procesado, registrado y con la
-            # maquina de estados al dia, puede el firmware borrarlo. Si se
-            # confirmara al recibirlo, un cierre en este hueco perderia el
-            # movimiento sin dejar ni rastro.
-            self._ack_event(message)
+            self._handle_motion(message)
 
         elif isinstance(message, DeviceError):
             self._log_event("error", "Error", f"{message.code}: {message.msg}")
 
-    def _ack_event(self, message: MotionEvent) -> None:
-        """Confirma el evento a la placa despues de haberlo procesado.
+    def _handle_motion(self, message: MotionEvent) -> None:
+        """Procesa un evento del sensor sin confirmarlo hasta que este guardado.
 
-        El gestor solo apunta el numero; el hilo lector lo escribe. Si el
-        enlace se esta cayendo no se pierde nada: el firmware lo reenviara al
-        reconectar y el gestor descartara el duplicado.
+        El orden es el centro de H-01 y no se puede alterar:
+
+        1. Si ``(boot_id, seq)`` ya se proceso, se vuelve a confirmar y nada
+           mas: ni transicion, ni sirena, ni segundo aviso.
+        2. Se calcula la transicion en memoria.
+        3. Se persisten en UNA transaccion el evento, su clave y el estado
+           resultante de la maquina. Si SQLite no puede, el mismo registro va
+           al buzon con ``fsync``.
+        4. Solo entonces se aplican los efectos y se confirma a la placa.
+
+        Si el paso 3 no consigue nada durable, no hay ACK. La placa conserva el
+        evento en su buffer y lo reenviara; la ventana avisa de que el registro
+        esta degradado en vez de fingir que la intrusion quedo guardada.
+        """
+        boot_id = message.boot_id
+        if boot_id is not None:
+            try:
+                duplicate = self._store.has_processed(boot_id, message.seq)
+            except Exception:  # noqa: BLE001 - se intenta registrar igual
+                log.debug("no se pudo comprobar el evento %d", message.seq, exc_info=True)
+                duplicate = False
+            if duplicate:
+                self._ack_event(message)
+                return
+
+        transition = self._controller.feed(message)
+        tag, kind, detail = self._describe_motion(message)
+        try:
+            values, remove, fingerprint = self._alarm_state_plan()
+        except Exception:  # noqa: BLE001 - sin estado se guarda al menos el evento
+            log.exception("no se pudo preparar el estado para el evento")
+            values, remove, fingerprint = {}, (), None
+
+        persisted = False
+        row = None
+        try:
+            row, new = self._store.record_motion(
+                boot_id,
+                message.seq,
+                tag,
+                kind,
+                detail,
+                state=values,
+                remove_state=remove,
+            )
+        except Exception as exc:  # noqa: BLE001 - el buzon es la segunda linea
+            log.exception("no se pudo guardar el evento %d en el historial", message.seq)
+            new = True
+            record = SpoolRecord(
+                boot_id=boot_id,
+                seq=message.seq,
+                tag=tag,
+                kind=kind,
+                detail=detail,
+                ts=time.time(),
+                state=values,
+                remove_state=remove,
+            )
+            if self._spool.append(record):
+                persisted = True
+                self._store_failures += 1
+                self._storage_degraded = True
+                if self._store_failures == 1:
+                    self._status("Aviso: el historial no se guarda; los eventos van al buzón.")
+                    self._update_storage_warning()
+            else:
+                self._unsaved_events += 1
+                self._storage_degraded = True
+                self._log.add_row(
+                    "error",
+                    "Historial",
+                    f"evento {message.seq} sin guardar: ni la base de datos ni el buzón "
+                    f"aceptaron la escritura ({exc})",
+                )
+                self._update_storage_warning()
+                return  # sin ACK: la placa lo conserva
+        else:
+            persisted = True
+
+        if not new:
+            # Otra sesion/entrega ya lo habia registrado: se confirma de nuevo
+            # para que la placa lo borre, pero no se repiten los efectos.
+            self._ack_event(message)
+            return
+
+        # El evento y el estado ya estan en disco (o en el buzon): desde aqui
+        # se puede dar el cambio por guardado sin volver a escribir.
+        self._state_fingerprint = fingerprint
+        self._persisted_armed = self._controller.armed
+        if self._controller.armed:
+            self._armed_at = float(values["armed_at"]) if "armed_at" in values else None
+        else:
+            self._armed_at = None
+
+        if row is not None:
+            self._log.add_row(tag, kind, detail, ts=row.ts)
+            self._refresh_log_footer()
+
+        self._count_motion(message)
+        if transition is not None:
+            self._apply_transition(transition, already_persisted=True)
+        if persisted:
+            self._ack_event(message)
+
+    def _describe_motion(self, message: MotionEvent) -> tuple[str, str, str]:
+        """Fila de historial que corresponde al evento."""
+        if message.kind is MotionKind.START:
+            return ("start", "Movimiento", "Detección iniciada")
+        if message.kind is MotionKind.END:
+            duration = f"{message.dur_ms} ms" if message.dur_ms else "—"
+            return ("end", "Fin de pulso", f"duración {duration}")
+        return ("bounce", "Rebote", "Flanco descartado por antirrebote")
+
+    def _count_motion(self, message: MotionEvent) -> None:
+        """Contadores y panel del sensor. Solo con eventos nuevos."""
+        self._events += 1
+        self._events_label.setText(str(self._events))
+        if message.kind is MotionKind.START:
+            self._pulses += 1
+            self._pulses_label.setText(str(self._pulses))
+            self._paint_sensor(True)
+        elif message.kind is MotionKind.END:
+            self._paint_sensor(False)
+
+    def _ack_event(self, message: MotionEvent) -> None:
+        """Confirma el evento a la placa despues de haberlo guardado.
+
+        El gestor solo apunta el numero; el hilo lector lo escribe. El
+        ``boot_id`` viaja con el acuse para que no se confirme por error un
+        ``seq`` de una sesion que la placa ya abandono. Si el enlace se esta
+        cayendo no se pierde nada: el firmware lo reenviara al reconectar.
         """
         manager = self._manager
         if manager is None:
             return
         try:
-            manager.ack_events(message.seq)
+            manager.ack_events(message.seq, message.boot_id)
         except Exception:  # noqa: BLE001 - un ACK no puede tumbar la interfaz
             log.debug("no se pudo confirmar el evento %d", message.seq, exc_info=True)
 
@@ -2578,8 +2760,89 @@ class MainWindow(QMainWindow):
     # Registro
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Estado persistente de la alarma
+    # ------------------------------------------------------------------
+
+    def _controller_options(self) -> dict[str, Any]:
+        """Argumentos de configuracion del controlador (sin el estado)."""
+        return {
+            "cooldown_s": self._config.alarm.cooldown_s,
+            "max_per_hour": self._config.alarm.max_per_hour,
+            "exit_delay_s": self._config.alarm.exit_delay_s,
+            "entry_delay_s": self._config.alarm.entry_delay_s,
+            "auto_rearm": self._config.alarm.auto_rearm,
+            "rearm_delay_s": self._config.alarm.rearm_delay_s,
+            "max_rearms": self._config.alarm.max_rearms,
+            "siren_s": self._config.buzzer.siren_ms / 1000,
+        }
+
+    def _build_controller(self) -> AlarmController:
+        """Controlador de arranque: snapshot completo, o la intencion guardada.
+
+        El snapshot puede estar en cualquier estado de los seis, no solo armada
+        o desarmada: cerrar el PC con la alarma disparada y volver a abrir sin
+        sirena dejaria una intrusion en curso sin aviso.
+        """
+        options = self._controller_options()
+        if self._config.alarm.restore_state_on_start and self._store.persistent:
+            snapshot, elapsed = self._load_alarm_snapshot()
+            if snapshot is not None:
+                try:
+                    controller = AlarmController.from_snapshot(
+                        snapshot, elapsed_s=elapsed, **options
+                    )
+                except Exception:  # noqa: BLE001 - el arranque no puede fallar
+                    log.exception("snapshot ilegible: se usa armed_on_start")
+                else:
+                    # Solo se deja constancia cuando la alarma NO arranca
+                    # desarmada: una fila «recuperada: desarmada» en cada
+                    # arranque es ruido y ademas tapa las que importan.
+                    if controller.armed:
+                        self._restored_state = controller.state
+                        self._armed_at = self._read_armed_at()
+                        self._restored_armed_at = self._armed_at
+                    log.info(
+                        "se recupera el estado %s guardado (%.0f s cerrada)",
+                        controller.state.value,
+                        elapsed,
+                    )
+                    return controller
+        armed_on_start = self._resolve_armed_on_start()
+        self._armed_at = self._read_armed_at() if armed_on_start else None
+        return AlarmController(armed_on_start=armed_on_start, **options)
+
+    def _load_alarm_snapshot(self) -> tuple[dict[str, object] | None, float]:
+        """Lee el snapshot y cuanto tiempo ha estado la aplicacion cerrada."""
+        try:
+            raw = self._store.get_state("alarm_snapshot")
+        except Exception:  # noqa: BLE001
+            log.exception("no se pudo leer el estado de la alarma")
+            return None, 0.0
+        if not raw:
+            return None, 0.0
+        try:
+            snapshot = json.loads(raw)
+        except json.JSONDecodeError:
+            log.warning("snapshot de alarma ilegible: se ignora")
+            return None, 0.0
+        if not isinstance(snapshot, dict):
+            log.warning("snapshot de alarma con formato inesperado: se ignora")
+            return None, 0.0
+        if snapshot.get("v") != SNAPSHOT_VERSION:
+            log.warning("snapshot de alarma de otra version: se ignora")
+            return None, 0.0
+
+        elapsed = 0.0
+        saved_at = snapshot.get("saved_at")
+        if isinstance(saved_at, (int, float)) and not isinstance(saved_at, bool):
+            # Un reloj que salta hacia atras no debe reabrir un retardo: se
+            # limita a un dia, que ya es mas que cualquier cierre razonable.
+            elapsed = min(_MAX_RESTORE_GAP_S, max(0.0, time.time() - float(saved_at)))
+        return snapshot, elapsed
+
     def _resolve_armed_on_start(self) -> bool:
-        """Con que estado nace el controlador.
+        """Con que estado nace el controlador si no hay snapshot.
 
         Orden: lo guardado (si `restore_state_on_start`) y, si no hay nada, el
         valor de configuracion. Nunca lanza: una base ilegible degrada a
@@ -2599,6 +2862,7 @@ class MainWindow(QMainWindow):
             log.warning("estado guardado ilegible (%r): se usa armed_on_start", value)
             return self._config.alarm.armed_on_start
         if armed == "true":
+            self._restored_state = AlarmState.ARMED
             self._restored_armed_at = self._read_armed_at()
             log.info("se recupera el estado ARMADA guardado")
         return armed == "true"
@@ -2613,29 +2877,98 @@ class MainWindow(QMainWindow):
             log.exception("no se pudo leer la hora del armado")
             return None
 
-    def _persist_armed_state(self) -> None:
-        """Guarda la intencion de armado para sobrevivir al reinicio.
+    def _alarm_state_plan(self) -> tuple[dict[str, str], tuple[str, ...], tuple[bool, str]]:
+        """Valores a guardar, claves a borrar y huella del estado.
 
-        Se llama en cada transicion, pero solo escribe cuando el estado logico
-        cambia de armada a desarmada o al reves: los retardos y los disparos no
-        tocan el disco.
+        La huella no incluye `saved_at` a proposito: si lo incluyera, el reloj
+        cambiaria en cada llamada y el disco se escribiria cuatro veces por
+        segundo sin que nada hubiera pasado.
         """
+        snapshot = dict(self._controller.to_snapshot())
         armed = self._controller.armed
-        if armed == self._persisted_armed:
-            return
-        self._persisted_armed = armed
+        stamp = snapshot.pop("saved_at", None)
+        fingerprint = (armed, json.dumps(snapshot, ensure_ascii=False, sort_keys=True))
+        if stamp is not None:
+            snapshot["saved_at"] = stamp
+
+        values: dict[str, str] = {
+            "armed_intent": "true" if armed else "false",
+            "alarm_snapshot": json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
+        }
+        remove: list[str] = []
+        if armed:
+            known = self._armed_at if self._armed_at is not None else time.time()
+            values["armed_at"] = f"{known:.0f}"
+        else:
+            remove.append("armed_at")
+        return values, tuple(remove), fingerprint
+
+    def _persist_alarm_state(self) -> None:
+        """Guarda el estado operativo completo en una sola transaccion.
+
+        Se llama en cada transicion. Solo escribe cuando algo del estado ha
+        cambiado, y solo da el cambio por guardado cuando el commit funciona:
+        si se diera por bueno antes, un fallo dejaria el estado en memoria
+        diciendo «ya esta» y no se volveria a intentar.
+        """
         try:
-            self._store.set_state("armed_intent", "true" if armed else "false")
-            if armed:
-                # Se conserva la hora del primer armado: si se viene de una
-                # recuperacion, la fila «ARMADA desde …» no debe saltar a la
-                # hora del ultimo reinicio.
-                if self._store.get_state("armed_at") is None:
-                    self._store.set_state("armed_at", f"{time.time():.0f}")
-            else:
-                self._store.clear_state("armed_at")
+            values, remove, fingerprint = self._alarm_state_plan()
+        except Exception:  # noqa: BLE001 - serializar el estado no debe caerse
+            log.exception("no se pudo preparar el estado de la alarma")
+            return
+        if fingerprint == self._state_fingerprint:
+            return
+        try:
+            self._store.set_state_many(values, remove=remove)
         except Exception:  # noqa: BLE001 - no puede tumbar la alarma
-            log.exception("no se pudo guardar el estado de armado")
+            log.exception("no se pudo guardar el estado de la alarma")
+            self._mark_storage_degraded()
+            return
+        self._state_fingerprint = fingerprint
+        self._persisted_armed = self._controller.armed
+        if self._controller.armed:
+            self._armed_at = float(values["armed_at"])
+        else:
+            self._armed_at = None
+
+    # ------------------------------------------------------------------
+    # Buzon durable
+    # ------------------------------------------------------------------
+
+    def _drain_spool(self) -> int:
+        """Reimporta al historial lo que quedo en el buzon. Sin ventana aun."""
+        try:
+            return self._spool.drain_into(self._store)
+        except Exception:  # noqa: BLE001 - el arranque no depende del buzon
+            log.exception("no se pudo reimportar el buzon")
+            return 0
+
+    def _mark_storage_degraded(self) -> None:
+        """Deja constancia visible de que el registro no es fiable."""
+        self._storage_degraded = True
+        if hasattr(self, "_storage_warning"):
+            self._update_storage_warning()
+
+    def _update_storage_warning(self) -> None:
+        """Pinta el aviso permanente de almacenamiento degradado."""
+        problems: list[str] = []
+        if not self._store.persistent:
+            problems.append("historial en memoria: se perderá al cerrar")
+        elif self._store_error:
+            problems.append("no se pudo abrir el historial")
+        if self._spool.pending:
+            problems.append(f"{self._spool.pending} evento(s) en el buzón")
+        if self._unsaved_events:
+            problems.append(f"{self._unsaved_events} evento(s) sin guardar")
+        if not problems:
+            if self._storage_warning.isVisible():
+                self._storage_warning.setVisible(False)
+            return
+        text = "REGISTRO NO PERSISTENTE: " + "; ".join(problems) + "."
+        if self._storage_warning.text() != text:
+            self._storage_warning.setText(text)
+        if not self._storage_warning.isVisible():
+            self._storage_warning.setVisible(True)
 
     def _open_store(self, path: Path | str | None) -> EventStore:
         """Abre el historial; si el disco falla, se sigue en memoria."""
@@ -2671,18 +3004,23 @@ class MainWindow(QMainWindow):
         self._refresh_log_footer()
 
     def _log_event(self, tag: str, kind: str, detail: str) -> None:
+        """Apunta una fila de historial que no bloquea nada si se pierde.
+
+        Es la via de las filas de la propia aplicacion (estado, voz, avisos).
+        Los eventos del sensor no pasan por aqui: su ACK exige una escritura
+        durable y los gestiona ``_handle_motion``.
+        """
         try:
             row = self._store.append(tag, kind, detail)
         except Exception as exc:  # noqa: BLE001 - el registro no tumba la app
             log.exception("no se pudo guardar el evento")
             self._store_failures += 1
+            self._storage_degraded = True
             self._log.add_row(tag, kind, detail)
             self._log.add_row("error", "Historial", f"no se pudo guardar en disco: {exc}")
-            # El evento se confirma igualmente: bloquear el ACK llenaria el
-            # buffer de 16 de la placa y perderia los siguientes. Queda dicho
-            # en pantalla que esta fila no sobrevivira al cierre.
             if self._store_failures == 1:
                 self._status("Aviso: el historial no se está guardando en disco.")
+                self._update_storage_warning()
             return
         self._log.add_row(tag, kind, detail, ts=row.ts)
         self._refresh_log_footer()
@@ -2961,6 +3299,8 @@ class MainWindow(QMainWindow):
                 self._last_health = Health.UNKNOWN
                 self._apply_health(Health.UNKNOWN)
             self._paint_connection(None)
+            if self._storage_degraded or self._spool.pending:
+                self._update_storage_warning()
             return
 
         if not manager.alive and not self._expect_disconnect:
@@ -2985,6 +3325,8 @@ class MainWindow(QMainWindow):
         if availability != self._availability:
             self._availability = availability
             self._paint_alarm()
+        if self._storage_degraded or self._spool.pending:
+            self._update_storage_warning()
         if health is Health.OFFLINE and manager.stats.last_error:
             self._status(f"Sin enlace: {manager.stats.last_error}")
 
