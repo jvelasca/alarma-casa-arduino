@@ -530,6 +530,7 @@ cd alarma-casa-arduino
 - [`doc/02-PROTOCOLO.md`](doc/02-PROTOCOLO.md) — referencia del protocolo serie v1
 - [`doc/03-AVISOS.md`](doc/03-AVISOS.md) — voz configurable, correo, SMS, push al móvil con ntfy, mando remoto, zumbador, credenciales y aviso de pérdida del enlace
 - [`doc/04-INTERFAZ.md`](doc/04-INTERFAZ.md) — ventana principal, botón de conexión, historial CSV, diálogos, atajos e iconos
+- [`doc/05-VALIDACION-HARDWARE.md`](doc/05-VALIDACION-HARDWARE.md) — campaña de validación en placa: compilación, protocolo, buffer, durabilidad, sirena y límites
 
 Contacto: **josealberto.vel@gmail.com** (también en **Ayuda → Acerca de**, con
 botón de copiar).
