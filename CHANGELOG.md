@@ -15,6 +15,35 @@ sigue [Keep a Changelog](https://keepachangelog.com/es/1.1.0/) y la numeración
 
 - Zonas, panel web y bandeja del sistema (F2-F3 de la hoja de ruta).
 
+## [0.1.6] — 2026-11-14
+
+La ventana deja de recortar el estado y las acciones al estrecharse. No hay
+cambios de protocolo, de esquema ni de firmware: el 1.7.0 sigue valiendo, y una
+copia de seguridad de 0.1.5 se restaura sin avisos.
+
+### Corregido
+
+- **El hero se adapta al tamano de la ventana.** Con la ventana estrecha,
+  «DESARMADA» se salia de la tarjeta y las etiquetas de Armar/Silenciar/Probar
+  sirena se recortaban, porque el cuerpo de la letra era fijo. `StateHero` busca
+  por biseccion el cuerpo mayor que cabe (30 → 13 pt el rotulo, 46 → 20 pt el
+  reloj) y pasa las acciones a columna cuando en una fila se recortarian; en
+  columna recorta holgura, icono (64 → 44 px), reloj (32 pt) y alto de botones
+  (58 → 46 px) para seguir cabiendo con la cuenta atras visible. El rotulo ya no
+  dicta el ancho del hero: con `QSizePolicy.Ignored` su `sizeHint` deja de entrar
+  en el minimo.
+- **La barra de acciones se adapta en vez de esconderse tras «>>».**
+  `AdaptiveToolBar` prueba texto+icono y, si no cabe, solo icono, de 26 a 16 px,
+  redibujando el SVG a cada tamano en vez de escalar el pixmap. A 1020 px caben
+  las trece acciones. La hoja de estilos global manda sobre `setFont`, asi que el
+  tamano variable se aplica con un `setStyleSheet` propio del widget.
+
+### Añadido
+
+- **Pruebas del comportamiento adaptativo** (`tests/test_ui.py`): el rotulo y el
+  reloj caben en el hero a varios anchos, las acciones pasan a columna cuando
+  toca, y la barra elige texto, solo icono o desplazamiento segun el espacio.
+
 ## [0.1.5] — 2026-11-13
 
 Cierra los cuatro hallazgos que la auditoría de 0.1.4 dejó abiertos. Las
